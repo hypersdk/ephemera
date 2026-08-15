@@ -57,9 +57,8 @@ reaper_interval_secs = 5
 
 # Only used by storage=ceph-rbd create requests (see "Storage backends" in
 # README.md) — every other storage backend (the default qcow2/raw overlay,
-# lvm-thin, nbd) needs no configuration here at all. ceph-rbd is implemented
-# against the real `rbd` CLI and QEMU's native rbd: driver but has not been
-# verified against a real Ceph cluster in this project's own testing.
+# lvm-thin, nbd) needs no configuration here at all. Verified against a real
+# Rook Ceph cluster.
 # [storage]
 # ceph_user = "admin"
 # ceph_conf = "/etc/ceph/ceph.conf"

@@ -103,11 +103,11 @@ pub enum StorageBackend {
     /// Ceph RBD. `request.image` is a `pool/image` reference to an existing
     /// RBD image; a snapshot on it named `ephemera-base` must already exist
     /// and be protected (`rbd snap protect`) for the per-VM clone to work.
-    /// Implemented against the real `rbd` CLI and QEMU's native `rbd:`
-    /// block driver, but — unlike every other backend in this project —
-    /// has never been exercised against a real Ceph cluster, because none
-    /// was available in this environment. Treat as implemented but
-    /// unverified.
+    /// Verified end to end against a real Rook Ceph cluster: `rbd clone`
+    /// produces a genuine per-VM thin clone, and QEMU boots a real guest to
+    /// a login prompt straight off the `rbd:` URI — see
+    /// `ephemera_image::storage::provision_ceph_rbd`. Does not support
+    /// automatic guest-agent token injection (see that function).
     CephRbd,
 }
 

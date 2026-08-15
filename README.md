@@ -83,7 +83,7 @@ for that step — see "Build an image" below.
 - Raw reflink copies for Firecracker / Cloud Hypervisor when the host filesystem supports reflinks.
 - Raw conversion fallback through `qemu-img`.
 - Optional disk growth.
-- Pluggable storage backends beyond the qcow2/raw defaults above: LVM thin snapshots and NBD-exported disks (both verified booting real guests), plus Ceph RBD (implemented, unverified — see "Storage backends" below).
+- Pluggable storage backends beyond the qcow2/raw defaults above: LVM thin snapshots, NBD-exported disks, and Ceph RBD — all three verified booting real guests (Ceph RBD against a real Rook Ceph cluster); see "Storage backends" below.
 - cloud-init NoCloud seed disk generation.
 - TAP interface creation and optional Linux bridge attachment.
 - macvtap networking (QEMU and Cloud Hypervisor) — a VM's own MAC directly on a parent link, no bridge.
@@ -630,23 +630,33 @@ implemented in `ephemera_image::storage`:
   mount) after this VM's own `qemu-nbd --persistent` export was already
   running raced its write lock and failed with "Failed to get 'write' lock".
   Fixed by injecting the token before the export starts, not after.
-- **`ceph-rbd`** — implemented against the real `rbd` CLI (`rbd clone
-  <pool>/<image>@ephemera-base ...`) and QEMU's native `rbd:` block driver
-  (QEMU only; Cloud Hypervisor/Firecracker have no built-in Ceph client),
-  but **never exercised against a real Ceph cluster** — none was available
-  in this project's test environment, unlike every other backend and
-  feature in this README. Treat it as implemented but unverified. It also
-  doesn't support automatic guest-agent token injection (`guestkit` needs a
-  local file or block device to mount, not an arbitrary `rbd:` URI) — that
-  combination fails fast with a clear error rather than attempting it.
+- **`ceph-rbd`** — `rbd clone <pool>/<image>@ephemera-base ...` and QEMU's
+  native `rbd:` block driver (QEMU only; Cloud Hypervisor/Firecracker have
+  no built-in Ceph client). Verified end to end against a real, live Rook
+  Ceph cluster (the Atlas storage-control-plane project's lab: Rook v1.20.2
+  + Ceph Squid v19.2.3, `rbd-nvme-prod` pool): imported a raw image as
+  `rbd-nvme-prod/ephemera-base`, protected an `ephemera-base` snapshot on
+  it, created a VM with `storage=ceph-rbd` — `rbd clone` produced a real
+  `eph-<id>` clone, QEMU booted a real guest straight off
+  `rbd:rbd-nvme-prod/eph-<id>:id=admin:conf=...` all the way to a login
+  prompt, and `delete` reaped the clone (confirmed gone via `rbd ls`, no
+  leak). Doesn't support automatic guest-agent token injection (`guestkit`
+  needs a local file or block device to mount, not an arbitrary `rbd:`
+  URI) — that combination fails fast with a clear error rather than
+  attempting it.
 
 `storage` defaults to unset (`Default`) on every create request — nothing
 above changes any existing behavior unless a caller opts in.
 
-See `scripts/test-storage-backends.sh` for the real-hardware regression test
-(`lvm-thin` and `nbd`; it does not attempt `ceph-rbd`, for the reason
-above) — it also sets up a loopback-backed thin pool from scratch if you
-don't already have one, see the script's own `--help` for that recipe.
+See `scripts/test-storage-backends.sh` for the repeatable real-hardware
+regression test covering `lvm-thin` and `nbd` (it also sets up a
+loopback-backed thin pool from scratch if you don't already have one — see
+the script's own `--help`). `ceph-rbd` isn't in that script — it was
+verified manually against the specific external Rook Ceph lab above, which
+this repo has no automated way to stand up or tear down; the recipe was:
+`rbd import` a raw image into a pool, `rbd snap create` + `rbd snap
+protect` an `ephemera-base` snapshot on it, then create a VM with
+`"storage":"ceph-rbd","image":"<pool>/<image>"`.
 
 ## REST API
 
@@ -864,7 +874,7 @@ assigned the same vsock CID.
 1. **Firecracker jailer's own `--cgroup`/`--resource-limit` flags** — not wired up, but superseded in practice: every VM (all three backends, not just jailed Firecracker) already gets real cgroup v2 resource control (CPU/memory/IO/pids/cpuset, freeze/thaw, stats, PSI pressure) independent of the jailer — see "Resource control (cgroup v2)" above.
 2. **Network namespace policy** — one namespace per VM (veth + NAT + internal bridge) is already implemented and opt-in per VM (see "Network namespaces" above); still missing: nftables instead of one flat iptables MASQUERADE rule per VM, and real IPAM (subnets are derived deterministically from the VM id rather than tracked/reused, a documented theoretical-collision tradeoff).
 3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
-4. **Storage abstraction** — already implemented: qcow2 CoW overlay and raw reflink (the always-on defaults, per VMM backend), plus opt-in LVM thin snapshots and NBD-exported disks, both verified booting real guests on real hardware; see "Storage backends" below. Ceph RBD is implemented (real `rbd` CLI + QEMU's native `rbd:` driver) but unverified — no Ceph cluster was available to test against. Not done: NVMe-local as a distinct backend (a local raw file/block device already gets NVMe's real performance with no extra abstraction needed — reflink/LVM already cover that case).
+4. **Storage abstraction** — already implemented and fully verified: qcow2 CoW overlay and raw reflink (the always-on defaults, per VMM backend), plus opt-in LVM thin snapshots, NBD-exported disks, and Ceph RBD — all verified booting real guests on real hardware, Ceph RBD against a real Rook Ceph cluster; see "Storage backends" below. Not done: NVMe-local as a distinct backend (a local raw file/block device already gets NVMe's real performance with no extra abstraction needed — reflink/LVM already cover that case).
 5. **Image catalog** — already implemented: named/checksummed/Ed25519-signed entries, distro/version/arch metadata (see "Image catalog & signing" above). Not done: a cosign/Sigstore option specifically, for shops standardized on that instead of this project's own signing scheme.
 6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).
 7. **Auth** — mTLS/OIDC, tenant IDs and audit events. Bearer-token REST auth/RBAC (admin/read-only) and a per-VM authenticated guest-agent protocol are already implemented; see "Auth / RBAC" and "Pause, resume, and exec" above.

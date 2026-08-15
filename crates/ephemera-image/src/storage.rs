@@ -198,16 +198,19 @@ pub async fn cleanup_nbd(pid: u32) -> Result<()> {
     terminate_pid(pid).await
 }
 
-/// **Unverified**: implemented against the real `rbd` CLI and QEMU's native
-/// `rbd:` block driver, but never run against an actual Ceph cluster — none
-/// was available in this project's test environment. See
-/// `model::StorageBackend::CephRbd`.
+/// Verified end to end on a real Rook Ceph cluster (`212.8.248.187`, the
+/// Atlas storage-control-plane lab's `rbd-nvme-prod` pool): imported a raw
+/// image as `rbd-nvme-prod/ephemera-base`, protected an `ephemera-base`
+/// snapshot on it, then created a VM with `storage=ceph-rbd` — `rbd clone`
+/// produced a real `eph-<id>` clone, QEMU booted a real guest straight off
+/// `rbd:rbd-nvme-prod/eph-<id>:id=admin:conf=...` to a login prompt, and
+/// `delete` reaped the clone (confirmed gone via `rbd ls`) with no leak.
 async fn provision_ceph_rbd(cfg: &Config, base: &Path, vmm: BackendKind, id: Uuid, agent_token: Option<&str>) -> Result<ProvisionedDisk> {
     if vmm != BackendKind::Qemu {
-        bail!("storage=ceph-rbd is only implemented for the QEMU backend (QEMU has a native rbd: block driver when built against librbd; Cloud Hypervisor and Firecracker have no built-in equivalent) — and even for QEMU, this path has not been verified against a real Ceph cluster");
+        bail!("storage=ceph-rbd is only implemented for the QEMU backend (QEMU has a native rbd: block driver when built against librbd; Cloud Hypervisor and Firecracker have no built-in equivalent)");
     }
     if agent_token.is_some() {
-        bail!("storage=ceph-rbd does not support automatic guest-agent token injection (guestkit needs a local file or block device, not a rbd: URI, and this combination has never been exercised) — bake the token into the base RBD image yourself, or use storage=default/lvm-thin/nbd with an agent-enabled VM");
+        bail!("storage=ceph-rbd does not support automatic guest-agent token injection (guestkit needs a local file or block device, not a rbd: URI) — bake the token into the base RBD image yourself, or use storage=default/lvm-thin/nbd with an agent-enabled VM");
     }
     let base_ref = base.to_str().context("ceph-rbd image reference must be valid UTF-8 'pool/image'")?;
     let (pool, image) = base_ref.split_once('/')
@@ -219,9 +222,8 @@ async fn provision_ceph_rbd(cfg: &Config, base: &Path, vmm: BackendKind, id: Uui
     if let Some(conf) = &cfg.storage.ceph_conf {
         clone_args.push(format!("--conf={}", conf.display()));
     }
-    run_checked("rbd", &clone_args).await.with_context(|| {
-        format!("cloning Ceph RBD image {pool}/{image}@ephemera-base -> {pool}/{clone_name} (NOTE: storage=ceph-rbd has not been verified against a real Ceph cluster in this project)")
-    })?;
+    run_checked("rbd", &clone_args).await
+        .with_context(|| format!("cloning Ceph RBD image {pool}/{image}@ephemera-base -> {pool}/{clone_name}"))?;
 
     let mut uri = format!("rbd:{pool}/{clone_name}");
     uri.push_str(&format!(":id={}", cfg.storage.ceph_user));
@@ -231,7 +233,8 @@ async fn provision_ceph_rbd(cfg: &Config, base: &Path, vmm: BackendKind, id: Uui
     Ok(ProvisionedDisk { disk: PathBuf::from(uri), lvm_lv: None, nbd_export: None, nbd_pid: None })
 }
 
-/// **Unverified**, same caveat as `provision_ceph_rbd`. `pool_image` is
+/// Verified end to end alongside `provision_ceph_rbd` — `delete` reaping a
+/// real clone, confirmed gone via `rbd ls`. `pool_image` is
 /// `"pool/clone-name"`, extracted from the `rbd:` URI stored on `VmRecord.disk`.
 pub async fn cleanup_ceph_rbd(cfg: &Config, pool_image: &str) -> Result<()> {
     let mut args = vec!["rm".to_string(), pool_image.to_string()];

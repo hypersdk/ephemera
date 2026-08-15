@@ -34,8 +34,8 @@ pub async fn call(vm: &VmRecord, request: AgentRequest, timeout: Duration) -> Re
         match vm.backend {
             BackendKind::Qemu => native_vsock_call(cid, port, &envelope).await,
             BackendKind::CloudHypervisor | BackendKind::Firecracker => {
-                let socket = vm.workspace.join("vsock.sock");
-                uds_proxy_call(&socket, port, &envelope).await
+                let socket = vm.vsock_socket.as_deref().context("VM has no vsock proxy socket recorded")?;
+                uds_proxy_call(socket, port, &envelope).await
             }
             BackendKind::Auto => bail!("VM has an unresolved BackendKind::Auto — this is a bug, backend selection must happen before a VM is persisted"),
         }

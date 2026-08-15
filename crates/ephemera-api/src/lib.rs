@@ -278,6 +278,8 @@ mod tests {
                 agent: agent_enabled.then(|| AgentSpec { enabled: true, port: 17777, token: None }),
             },
             guest_cid: None,
+            jail_path: None,
+            vsock_socket: None,
         }
     }
 

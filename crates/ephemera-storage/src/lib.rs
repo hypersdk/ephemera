@@ -309,6 +309,8 @@ mod tests {
                 agent: None,
             },
             guest_cid: None,
+            jail_path: None,
+            vsock_socket: None,
         }
     }
 

@@ -162,6 +162,13 @@ pub struct VmRecord {
     /// Host-unique AF_VSOCK CID assigned when `request.agent` is enabled.
     #[serde(default)]
     pub guest_cid: Option<u32>,
+    /// Firecracker-jailer only — see `backend::LaunchResult::jail_path`.
+    #[serde(default)]
+    pub jail_path: Option<PathBuf>,
+    /// Host-visible path to the vsock proxy UDS (Cloud Hypervisor/
+    /// Firecracker only) — see `backend::LaunchResult::vsock_socket`.
+    #[serde(default)]
+    pub vsock_socket: Option<PathBuf>,
 }
 
 /// A named template for a warm pool: `size` VMs matching `template` are

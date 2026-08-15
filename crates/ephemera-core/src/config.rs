@@ -25,6 +25,7 @@ pub struct Config {
     pub reaper_interval_secs: u64,
     pub policy: Policy,
     pub auth: AuthConfig,
+    pub jailer: JailerConfig,
 }
 
 impl Default for Config {
@@ -46,6 +47,43 @@ impl Default for Config {
             reaper_interval_secs: 5,
             policy: Policy::default(),
             auth: AuthConfig::default(),
+            jailer: JailerConfig::default(),
+        }
+    }
+}
+
+/// Firecracker-only: runs the VM through Firecracker's own `jailer` binary
+/// (chroot, uid/gid drop, cgroups) instead of exec'ing `firecracker`
+/// directly. `enabled: false` (the default) is a full no-op — every
+/// Firecracker VM launches exactly as it did before this existed. QEMU and
+/// Cloud Hypervisor have no jailer equivalent and ignore this entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JailerConfig {
+    pub enabled: bool,
+    pub jailer_binary: String,
+    /// The uid/gid `jailer` drops privileges to after chrooting — must be
+    /// non-root and (for a real security boundary) not shared with any
+    /// other tenant's jail. Defaults match the values commonly used in
+    /// Firecracker's own getting-started docs; change them for anything
+    /// beyond a single-tenant host.
+    pub uid: u32,
+    pub gid: u32,
+    /// Base directory jailer creates `<exec-file-name>/<vm-id>/root/` under.
+    /// Must be on the same filesystem as `state_dir` for the hardlink-based
+    /// resource placement in `ephemera-firecracker` to avoid falling back
+    /// to a full copy of the (potentially multi-GB) rootfs.
+    pub chroot_base_dir: PathBuf,
+}
+
+impl Default for JailerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jailer_binary: "jailer".into(),
+            uid: 123,
+            gid: 100,
+            chroot_base_dir: "/srv/jailer".into(),
         }
     }
 }

@@ -36,6 +36,20 @@ pub struct LaunchContext {
 pub struct LaunchResult {
     pub pid: u32,
     pub control_socket: Option<PathBuf>,
+    /// Firecracker-jailer only: the chroot directory this VM's resources
+    /// were placed under (`<chroot_base_dir>/firecracker/<id>/root`),
+    /// recorded on the `VmRecord` so `VmManager::delete` can reclaim it
+    /// regardless of whether `cfg.jailer.enabled` is still true by the time
+    /// the VM is deleted — the config could change in between.
+    pub jail_path: Option<PathBuf>,
+    /// The actual host-visible path to the vsock proxy UDS a backend
+    /// creates (Cloud Hypervisor/Firecracker only), echoed back because it
+    /// isn't always `LaunchContext::vsock_socket` unchanged — a jailed
+    /// Firecracker VM's proxy socket lives inside its chroot
+    /// (`jail_path`/vsock.sock`), not at the path originally requested.
+    /// `ephemera_vsock_client` dials this path directly rather than
+    /// reconstructing it, so it works for both cases.
+    pub vsock_socket: Option<PathBuf>,
 }
 
 #[async_trait]

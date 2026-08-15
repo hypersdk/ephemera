@@ -162,6 +162,8 @@ impl VmManager {
             error: None,
             request: req.clone(),
             guest_cid: None,
+            jail_path: None,
+            vsock_socket: None,
         };
         // Deciding the CID and reserving it happen as one atomic, locked
         // operation in the store — see ephemera-storage::Store::insert_with_cid
@@ -206,6 +208,8 @@ impl VmManager {
             let launch = backend(req.backend)?.launch(&self.cfg, &req, &ctx).await?;
             record.pid = Some(launch.pid);
             record.control_socket = launch.control_socket;
+            record.jail_path = launch.jail_path;
+            record.vsock_socket = launch.vsock_socket;
             record.status = VmStatus::Running;
             Ok(())
         }.await;
@@ -267,6 +271,8 @@ impl VmManager {
             let launch = backend(vm.backend)?.launch(&self.cfg, &vm.request, &ctx).await?;
             vm.pid = Some(launch.pid);
             vm.control_socket = launch.control_socket;
+            vm.jail_path = launch.jail_path;
+            vm.vsock_socket = launch.vsock_socket;
             vm.status = VmStatus::Running;
             vm.error = None;
             Ok(())
@@ -358,6 +364,12 @@ impl VmManager {
         }
         let vm = self.store.remove(id).await?.context("VM vanished")?;
         if vm.workspace.exists() { fs::remove_dir_all(vm.workspace)?; }
+        // Firecracker-jailer VMs place resources under a separate chroot
+        // tree (`cfg.jailer.chroot_base_dir`, not `state_dir`) that
+        // `workspace` above never covers.
+        if let Some(jail_path) = &vm.jail_path {
+            if jail_path.exists() { fs::remove_dir_all(jail_path)?; }
+        }
         Ok(())
     }
 

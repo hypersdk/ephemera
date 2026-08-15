@@ -92,7 +92,7 @@ impl VmBackend for QemuBackend {
         }
         let child = spawned?;
         let pid = child.id().context("QEMU exited before PID was available")?;
-        Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("qmp.sock")) })
+        Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("qmp.sock")), jail_path: None, vsock_socket: None })
     }
 
     async fn pause(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {

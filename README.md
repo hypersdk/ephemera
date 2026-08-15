@@ -9,7 +9,7 @@ Firecracker, Cloud Hypervisor, and QEMU/KVM from one Rust-native control plane.
 
 It also contains a small **virt-builder-style image pipeline**: use a local/HTTP base image, verify SHA-256, convert/resize it, and customize it with `virt-customize`.
 
-> This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Before exposing it to untrusted tenants, add authentication/RBAC, Firecracker jailer, cgroups, seccomp/AppArmor/SELinux policy, per-tenant network namespaces, quotas, audit logging and stronger image provenance.
+> This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC and the Firecracker jailer (chroot + uid/gid isolation) are already implemented (see "Auth / RBAC" and "Firecracker jailer" below) — before exposing it to untrusted tenants, still add jailer cgroup limits, seccomp/AppArmor/SELinux policy, per-tenant network namespaces, quotas, audit logging and stronger image provenance.
 
 ## Architecture
 
@@ -254,6 +254,37 @@ sudo /usr/local/bin/ephemera --config /etc/ephemera.toml create \
 ```
 
 Firecracker does not use BIOS/UEFI in this flow. The request supplies the Linux kernel and the manager supplies a raw block rootfs.
+
+## Firecracker jailer (chroot, uid/gid isolation, cgroups)
+
+Opt-in, off by default, config-only (no per-VM flag) — every Firecracker VM either goes through
+`jailer` or none do:
+
+```toml
+[jailer]
+enabled = true
+jailer_binary = "jailer"          # resolved via $PATH unless you give an absolute path
+uid = 123                         # must be non-root; unique per tenant for a real isolation boundary
+gid = 100
+chroot_base_dir = "/srv/jailer"   # should be on the same filesystem as state_dir (see below)
+```
+
+`firecracker_binary` must be an absolute path when jailer is enabled — `jailer`'s `--exec-file` needs
+a real path, not a bare command resolved via `$PATH`.
+
+Ephemera hardlinks the kernel and rootfs into `jailer`'s chroot (`<chroot_base_dir>/<firecracker
+basename>/<vm-id>/root/`) before invoking it — falling back to a real copy if `chroot_base_dir` is on
+a different filesystem than the source files, which is why same-filesystem placement matters (a
+multi-GB rootfs copy per VM otherwise). Every subsequent control-plane operation (pause/resume/stop,
+vsock exec) is routed through the VM's *actual* recorded socket paths rather than a path reconstructed
+from its workspace directory — necessary because jailing relocates both the Firecracker API socket and
+the vsock proxy socket into the chroot, a genuinely different location than the non-jailed case.
+
+Verified on real hardware (`scripts/test-firecracker-jailer.sh`): the resulting Firecracker process
+really runs as the configured unprivileged uid/gid (confirmed via `ps`, not just "the command didn't
+error"); the guest boots and answers `exec` over vsock through the relocated proxy socket;
+pause/resume/stop all work against the relocated API socket; `delete` cleans up both the normal
+workspace and the separate jail chroot tree, leaving no orphaned files or process.
 
 ## Auto backend selection
 
@@ -631,7 +662,7 @@ assigned the same vsock CID.
 
 ## Production changes I would make next
 
-1. **Firecracker jailer backend** — chroot, uid/gid isolation, cgroups, resource limits.
+1. **Firecracker jailer resource limits** — `jailer`'s cgroup/resource-limit flags (`--cgroup`, `--resource-limit`) aren't wired up yet; chroot + uid/gid isolation are already implemented — see "Firecracker jailer" above.
 2. **Network namespaces** — one namespace per VM, veth/TAP, nftables, DHCP/IPAM.
 3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.

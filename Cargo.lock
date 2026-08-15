@@ -937,6 +937,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephemera-cgroup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "ephemera-cli"
 version = "0.1.0"
 dependencies = [
@@ -970,6 +981,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "ephemera-cgroup",
  "libc",
  "serde",
  "serde_json",
@@ -1055,6 +1067,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "ephemera-cgroup",
  "ephemera-cloud-hypervisor",
  "ephemera-core",
  "ephemera-firecracker",

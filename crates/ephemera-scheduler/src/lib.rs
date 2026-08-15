@@ -117,7 +117,116 @@ impl VmManager {
         cfg.ensure_dirs()?;
         let store = Arc::new(Store::load(&cfg.state_dir)?);
         let pools = Arc::new(PoolStore::load(&cfg.state_dir)?);
+        // Best-effort: delegating cgroup controllers needs to write under
+        // /sys/fs/cgroup, which isn't available in every environment this
+        // constructor runs in (e.g. an unprivileged `cargo test`) — a
+        // failure here shouldn't block VmManager from doing everything
+        // else, only resource-control/metrics for VMs it launches.
+        if let Err(e) = ephemera_cgroup::ensure_delegation() {
+            tracing::warn!(error = %e, "failed to delegate cgroup controllers — resource control/metrics will be unavailable");
+        }
         Ok(Arc::new(Self { cfg, store, pools, backfill_locks: AsyncMutex::new(HashMap::new()) }))
+    }
+
+    /// Create the VM's cgroup and migrate `pid` into it, storing the
+    /// resulting path on `record`. Best-effort and non-fatal: a VM whose
+    /// cgroup setup fails still runs — it just can't be resource-controlled
+    /// or have its metrics read later (`set_resources`/`freeze`/`metrics`/
+    /// `pressure` all report a clear "no cgroup" error rather than a
+    /// confusing failure deeper in the cgroupfs).
+    fn attach_cgroup(id: Uuid, pid: u32, record: &mut VmRecord) {
+        match ephemera_cgroup::CgroupManager::create_and_migrate(&id.to_string(), pid) {
+            Ok(mgr) => record.cgroup_path = Some(mgr.path().to_path_buf()),
+            Err(e) => tracing::warn!(vm = %id, error = %e, "failed to create cgroup for VM — resource control/metrics unavailable for it"),
+        }
+    }
+
+    fn cgroup_manager(&self, vm: &VmRecord) -> Result<ephemera_cgroup::CgroupManager> {
+        let path = vm.cgroup_path.clone().with_context(|| {
+            format!("VM {} has no cgroup (not running, or cgroup setup failed at launch)", vm.id)
+        })?;
+        Ok(ephemera_cgroup::CgroupManager::from_path(path)?)
+    }
+
+    /// Apply a partial set of cgroup v2 resource-control settings — only
+    /// the fields set in `patch` are touched.
+    pub async fn set_resources(&self, id: Uuid, patch: ephemera_core::model::ResourcePatch) -> Result<()> {
+        let vm = self.get(id).await?;
+        let mgr = self.cgroup_manager(&vm)?;
+        if let Some(percent) = patch.cpu_quota_percent {
+            mgr.cpu().set_max(&ephemera_cgroup::CpuMax::from_percent(percent as u64))?;
+        }
+        if let Some(bytes) = patch.memory_max_bytes {
+            mgr.memory().set_max(bytes)?;
+        }
+        if let Some(weight) = patch.io_weight {
+            mgr.io().set_weight(weight as u64)?;
+        }
+        if let Some(max) = patch.pids_max {
+            mgr.pids().set_max(max)?;
+        }
+        if let Some(cpus) = &patch.cpuset_cpus {
+            mgr.cpuset().set_cpus(cpus)?;
+        }
+        Ok(())
+    }
+
+    pub async fn freeze(&self, id: Uuid) -> Result<()> {
+        let vm = self.get(id).await?;
+        Ok(self.cgroup_manager(&vm)?.freezer().freeze()?)
+    }
+
+    pub async fn thaw(&self, id: Uuid) -> Result<()> {
+        let vm = self.get(id).await?;
+        Ok(self.cgroup_manager(&vm)?.freezer().thaw()?)
+    }
+
+    pub async fn is_frozen(&self, id: Uuid) -> Result<bool> {
+        let vm = self.get(id).await?;
+        Ok(self.cgroup_manager(&vm)?.freezer().is_frozen()?)
+    }
+
+    /// Point-in-time CPU/memory/disk usage, read from the VM's cgroup.
+    pub async fn metrics(&self, id: Uuid) -> Result<ephemera_core::model::VmMetrics> {
+        let vm = self.get(id).await?;
+        let mgr = self.cgroup_manager(&vm)?;
+
+        let cpu_stat = mgr.cpu().get_stat()?;
+        let num_cpus = mgr.cpuset().get_cpus_effective().ok().filter(|c| !c.is_empty()).map(|c| c.len() as u64).unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1)
+        });
+        let uptime_secs = std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(str::to_string))
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(1.0);
+        let total_usec = (uptime_secs * 1_000_000.0) as u64 * num_cpus;
+        let cpu_usage_percent =
+            if total_usec == 0 { 0.0 } else { (cpu_stat.usage_usec as f64 / total_usec as f64 * 100.0).clamp(0.0, 100.0 * num_cpus as f64) };
+
+        let memory_usage_bytes = mgr.memory().get_current()?;
+
+        let (disk_read_bytes, disk_write_bytes) = mgr.io().get_stat().map(|stats| {
+            stats.iter().fold((0u64, 0u64), |(r, w), s| (r + s.rbytes, w + s.wbytes))
+        }).unwrap_or((0, 0));
+
+        Ok(ephemera_core::model::VmMetrics { cpu_usage_percent, memory_usage_bytes, disk_read_bytes, disk_write_bytes })
+    }
+
+    /// PSI pressure stats for the VM's cgroup.
+    pub async fn pressure(&self, id: Uuid) -> Result<ephemera_core::model::VmPressure> {
+        let vm = self.get(id).await?;
+        let mgr = self.cgroup_manager(&vm)?;
+        let cpu = mgr.cpu().get_pressure().ok();
+        let mem = mgr.memory().get_pressure().ok();
+        let io = mgr.io().get_pressure().ok();
+        Ok(ephemera_core::model::VmPressure {
+            cpu_some: cpu.map(|p| p.some),
+            memory_some: mem.as_ref().map(|p| p.some.clone()),
+            memory_full: mem.and_then(|p| p.full),
+            io_some: io.as_ref().map(|p| p.some.clone()),
+            io_full: io.and_then(|p| p.full),
+        })
     }
 
     pub async fn create(self: &Arc<Self>, mut req: CreateVmRequest) -> Result<VmRecord> {
@@ -164,6 +273,7 @@ impl VmManager {
             guest_cid: None,
             jail_path: None,
             vsock_socket: None,
+            cgroup_path: None,
         };
         // Deciding the CID and reserving it happen as one atomic, locked
         // operation in the store — see ephemera-storage::Store::insert_with_cid
@@ -210,6 +320,7 @@ impl VmManager {
             record.control_socket = launch.control_socket;
             record.jail_path = launch.jail_path;
             record.vsock_socket = launch.vsock_socket;
+            Self::attach_cgroup(id, launch.pid, &mut record);
             record.status = VmStatus::Running;
             Ok(())
         }.await;
@@ -273,6 +384,7 @@ impl VmManager {
             vm.control_socket = launch.control_socket;
             vm.jail_path = launch.jail_path;
             vm.vsock_socket = launch.vsock_socket;
+            Self::attach_cgroup(id, launch.pid, &mut vm);
             vm.status = VmStatus::Running;
             vm.error = None;
             Ok(())
@@ -310,6 +422,17 @@ impl VmManager {
             }
         }
         if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
+        // cgroup v2 requires a cgroup to be empty (no PIDs left in
+        // cgroup.procs) before rmdir succeeds — safe here since the process
+        // is confirmed dead by this point either way (graceful exit,
+        // terminate_pid, or it just never had one to begin with).
+        if let Some(cgroup_path) = vm.cgroup_path.take() {
+            if let Ok(mgr) = ephemera_cgroup::CgroupManager::from_path(cgroup_path) {
+                if let Err(e) = mgr.remove() {
+                    tracing::warn!(vm = %id, error = %e, "failed to remove VM cgroup");
+                }
+            }
+        }
         vm.status = VmStatus::Stopped;
         vm.pid = None;
         self.store.update(vm.clone()).await?;
@@ -383,6 +506,11 @@ impl VmManager {
                         vm.status = VmStatus::Stopped;
                         vm.pid = None;
                         if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
+                        if let Some(cgroup_path) = vm.cgroup_path.take() {
+                            if let Ok(mgr) = ephemera_cgroup::CgroupManager::from_path(cgroup_path) {
+                                let _ = mgr.remove();
+                            }
+                        }
                         self.store.update(vm).await?;
                     }
                 }

@@ -1,0 +1,18 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ephemera-cgroup"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "cgroup v2 resource control and metrics for Ephemera-managed VMs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+anyhow = "1"

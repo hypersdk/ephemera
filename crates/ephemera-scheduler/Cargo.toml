@@ -18,6 +18,7 @@ ephemera-cloud-hypervisor = { path = "../ephemera-cloud-hypervisor" }
 ephemera-firecracker = { path = "../ephemera-firecracker" }
 ephemera-guest-protocol = { path = "../ephemera-guest-protocol" }
 ephemera-vsock-client = { path = "../ephemera-vsock-client" }
+ephemera-cgroup = { path = "../ephemera-cgroup" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }

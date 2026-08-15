@@ -311,6 +311,7 @@ mod tests {
             guest_cid: None,
             jail_path: None,
             vsock_socket: None,
+            cgroup_path: None,
         }
     }
 

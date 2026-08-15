@@ -5,6 +5,7 @@
 resolver = "3"
 members = [
     "crates/ephemera-core",
+    "crates/ephemera-cgroup",
     "crates/ephemera-storage",
     "crates/ephemera-network",
     "crates/ephemera-image",

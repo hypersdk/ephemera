@@ -169,6 +169,11 @@ pub struct VmRecord {
     /// Firecracker only) — see `backend::LaunchResult::vsock_socket`.
     #[serde(default)]
     pub vsock_socket: Option<PathBuf>,
+    /// cgroup v2 path (`ephemera.slice/{id}.scope`) the launched VMM
+    /// process was migrated into, once `VmManager` has done so —
+    /// `None` until the first successful launch completes cgroup setup.
+    #[serde(default)]
+    pub cgroup_path: Option<PathBuf>,
 }
 
 /// A named template for a warm pool: `size` VMs matching `template` are
@@ -210,4 +215,48 @@ pub struct ClaimOverrides {
     pub name: Option<String>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+}
+
+/// cgroup v2 resource-control settings to apply to a running VM. Every
+/// field is optional so a caller only touches what it actually wants to
+/// change — see `VmManager::set_resources`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourcePatch {
+    /// CPU quota as a percentage of one core (200 = 2 full cores).
+    #[serde(default)]
+    pub cpu_quota_percent: Option<u32>,
+    /// Memory limit in bytes.
+    #[serde(default)]
+    pub memory_max_bytes: Option<u64>,
+    /// I/O weight (1-10000, default 100).
+    #[serde(default)]
+    pub io_weight: Option<u32>,
+    /// Maximum number of PIDs in the VM's cgroup.
+    #[serde(default)]
+    pub pids_max: Option<u64>,
+    /// Pin the VM to these host CPU cores.
+    #[serde(default)]
+    pub cpuset_cpus: Option<Vec<u32>>,
+}
+
+/// Point-in-time resource usage for a VM, read from its cgroup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmMetrics {
+    /// CPU usage as a percentage of one core, averaged over the process's
+    /// entire lifetime (not an instantaneous rate).
+    pub cpu_usage_percent: f64,
+    pub memory_usage_bytes: u64,
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+}
+
+/// PSI (Pressure Stall Information) for a VM's cgroup — see
+/// `ephemera_cgroup::PressureStats` for field semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmPressure {
+    pub cpu_some: Option<ephemera_cgroup::PressureRecord>,
+    pub memory_some: Option<ephemera_cgroup::PressureRecord>,
+    pub memory_full: Option<ephemera_cgroup::PressureRecord>,
+    pub io_some: Option<ephemera_cgroup::PressureRecord>,
+    pub io_full: Option<ephemera_cgroup::PressureRecord>,
 }

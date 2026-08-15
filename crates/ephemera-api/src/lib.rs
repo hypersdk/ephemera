@@ -84,6 +84,12 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/stop", post(stop_vm))
         .route("/v1/vms/{id}/pause", post(pause_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
+        .route("/v1/vms/{id}/resources", post(set_vm_resources))
+        .route("/v1/vms/{id}/freeze", post(freeze_vm))
+        .route("/v1/vms/{id}/thaw", post(thaw_vm))
+        .route("/v1/vms/{id}/frozen", get(vm_frozen))
+        .route("/v1/vms/{id}/stats", get(vm_stats))
+        .route("/v1/vms/{id}/pressure", get(vm_pressure))
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
         .route("/v1/pools", post(create_pool).get(list_pools))
@@ -187,6 +193,41 @@ async fn resume_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<R
     Ok(Json(json!(m.resume(id).await?)))
 }
 
+async fn set_vm_resources(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(patch): Json<ephemera_core::model::ResourcePatch>,
+) -> ApiResult<StatusCode> {
+    require_admin(role)?;
+    m.set_resources(id, patch).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn freeze_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+    require_admin(role)?;
+    m.freeze(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn thaw_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+    require_admin(role)?;
+    m.thaw(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn vm_frozen(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!({"frozen": m.is_frozen(id).await?})))
+}
+
+async fn vm_stats(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!(m.metrics(id).await?)))
+}
+
+async fn vm_pressure(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!(m.pressure(id).await?)))
+}
+
 #[derive(Deserialize)]
 struct ExecRequest {
     command: String,
@@ -280,6 +321,7 @@ mod tests {
             guest_cid: None,
             jail_path: None,
             vsock_socket: None,
+            cgroup_path: None,
         }
     }
 

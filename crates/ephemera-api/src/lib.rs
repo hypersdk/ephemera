@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,

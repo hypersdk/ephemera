@@ -1,3 +1,6 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
 [Unit]
 Description=Zyvor Ephemera control plane
 After=network-online.target

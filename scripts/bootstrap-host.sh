@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
 # Prepare a fresh Linux host to run Zyvor Ephemera: install QEMU/cloud-init/
 # libguestfs tooling via the system package manager, install Cloud Hypervisor
 # and Firecracker from upstream releases, create the state directories and an

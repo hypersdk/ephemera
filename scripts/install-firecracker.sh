@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
 # Install Firecracker (+ jailer) from upstream GitHub releases, verified
 # against the SHA-256 digest GitHub records for the release asset.
 #

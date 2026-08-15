@@ -84,6 +84,7 @@ make next" — they are workspace members but contain no functionality yet.
 - `virt-customize` package/hostname/command/SSH-key customization.
 - systemd unit and one-command host bootstrap (installs QEMU tooling, Cloud Hypervisor, and Firecracker).
 - SSH/rsync remote deploy script with full and quick profiles.
+- End-to-end networking smoke test (QEMU user-mode NAT and TAP+bridge+DHCP, both SSH-verified).
 
 ## Host requirements
 
@@ -155,11 +156,34 @@ packages + Cloud Hypervisor/Firecracker, install a Rust toolchain if needed, bui
 binary, config, and systemd unit.
 
 ```bash
-./scripts/deploy-remote.sh 80.79.5.173 sus --key   # full deploy, SSH key auth
-./scripts/deploy-remote.sh sus@80.79.5.173 --quick  # rsync + build only, skip dep install
-./scripts/deploy-remote.sh 80.79.5.173 sus --verify-only
+./scripts/deploy-remote.sh 10.0.0.5 deploy --key   # full deploy, SSH key auth
+./scripts/deploy-remote.sh deploy@10.0.0.5 --quick  # rsync + build only, skip dep install
+./scripts/deploy-remote.sh 10.0.0.5 deploy --verify-only
 ./scripts/deploy-remote.sh --help
 ```
+
+## Testing networking end-to-end
+
+`scripts/test-networking.sh` boots real VMs over each supported network mode and proves they're
+actually reachable over SSH — not just that the process launched:
+
+- **QEMU user-mode NAT** + host port forward (no host network changes required).
+- **TAP + Linux bridge + DHCP** (against an existing bridge with a DHCP server on it, e.g.
+  libvirt's `virbr0` or a bridge set up by `bootstrap-host.sh`). Skipped with a warning if the
+  bridge doesn't exist.
+
+Both cases also assert cleanup: the QEMU process and (for TAP) the tap interface must actually be
+gone after `ephemera delete` — this is what caught a TAP-interface leak during development (fixed
+by making VM shutdown wait for the process to actually exit before releasing its network resources).
+
+```bash
+sudo ./scripts/test-networking.sh                    # bridge defaults to vmbr0
+sudo ./scripts/test-networking.sh --bridge virbr0     # test against libvirt's default network
+sudo ./scripts/test-networking.sh --image /path/to/base.qcow2   # skip auto-downloading a test image
+```
+
+It downloads an Ubuntu 24.04 cloud image on first run (cached under `<state_dir>/images/`) unless
+`--image` is given, generates a throwaway SSH keypair, and prints a pass/fail/warn summary.
 
 ## Create a QEMU disposable VM
 

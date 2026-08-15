@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
 # ─────────────────────────────────────────────────────────────
 # Zyvor Ephemera — Remote deployment (SSH + rsync)
 #
@@ -64,10 +67,10 @@ Environment:
   DEPLOY_DIR             Override remote staging dir (default: ~/.deployments/ephemera)
 
 Examples:
-  $0 80.79.5.173 sus --key
-  $0 sus@80.79.5.173 --quick
-  $0 80.79.5.173 root --build-local --quick
-  $0 80.79.5.173 sus --verify-only
+  $0 10.0.0.5 deploy --key
+  $0 deploy@10.0.0.5 --quick
+  $0 10.0.0.5 root --build-local --quick
+  $0 10.0.0.5 deploy --verify-only
 EOF
 }
 

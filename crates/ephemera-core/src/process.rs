@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{bail, Context, Result};
 use std::{fs::OpenOptions, path::Path, process::Stdio};
 use tokio::process::{Child, Command};
@@ -39,10 +42,27 @@ pub async fn spawn_logged(program: &str, args: &[String], log: &Path) -> Result<
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
+        // Detach into its own process group so the VMM survives independent of
+        // whatever session/terminal invoked `ephemera` (e.g. an SSH command
+        // session ending must not SIGHUP a VM that's meant to keep running).
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawning {program}"))
 }
 
+async fn wait_for_exit(pid: u32, attempts: u32) -> bool {
+    for _ in 0..attempts {
+        if !process_alive(pid).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Sends SIGTERM and waits for the process to actually exit (escalating to
+/// SIGKILL after a grace period) so callers can safely reclaim resources the
+/// process held, e.g. a TAP device's file descriptor, once this returns.
 pub async fn terminate_pid(pid: u32) -> Result<()> {
     let status = Command::new("kill")
         .arg("-TERM")
@@ -53,15 +73,25 @@ pub async fn terminate_pid(pid: u32) -> Result<()> {
     if !status.success() {
         bail!("failed to terminate pid {pid}");
     }
-    Ok(())
+    if wait_for_exit(pid, 50).await {
+        return Ok(());
+    }
+    let _ = Command::new("kill").arg("-KILL").arg(pid.to_string()).status().await;
+    if wait_for_exit(pid, 20).await {
+        return Ok(());
+    }
+    bail!("pid {pid} did not exit after SIGTERM/SIGKILL");
 }
 
 pub async fn process_alive(pid: u32) -> bool {
+    // A dead pid is an expected, common result (e.g. while polling for exit
+    // in terminate_pid), so capture output rather than let `kill`'s "No such
+    // process" message leak to our stderr on every negative check.
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
-        .status()
+        .output()
         .await
-        .map(|s| s.success())
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }

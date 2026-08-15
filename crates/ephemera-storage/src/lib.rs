@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result};
 use ephemera_core::model::VmRecord;
 use std::{collections::HashMap, fs, path::{Path, PathBuf}};

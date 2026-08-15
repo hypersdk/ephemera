@@ -1,3 +1,6 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
 listen = "127.0.0.1:7788"
 state_dir = "/var/lib/ephemera"
 run_dir = "/run/ephemera"

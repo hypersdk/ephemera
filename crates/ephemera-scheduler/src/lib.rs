@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, Utc};
 use ephemera_core::{

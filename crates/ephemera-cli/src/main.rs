@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ephemera_api as api;

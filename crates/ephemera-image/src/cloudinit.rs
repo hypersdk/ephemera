@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result};
 use ephemera_core::{config::Config, model::CloudInitSpec, process::run_checked};
 use std::{fs, path::{Path, PathBuf}};

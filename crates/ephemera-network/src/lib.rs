@@ -1,3 +1,6 @@
+// Copyright 2026 Zyvor
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{bail, Result};
 use ephemera_core::{backend::PreparedNetwork, config::Config, model::NetworkSpec, process::run_checked};
 use uuid::Uuid;

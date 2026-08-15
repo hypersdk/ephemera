@@ -29,6 +29,13 @@ jobs:
         with:
           components: clippy
 
+      # guestkit's default feature set pulls in libsystemd-sys (journal-native
+      # logging), which needs libsystemd-dev's pkg-config file — not present
+      # on the runner image by default. guestkit's own CI hit and fixed this
+      # exact gap; we need it too since we build guestkit as a dependency.
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libsystemd-dev
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:

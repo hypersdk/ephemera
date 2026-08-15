@@ -336,6 +336,65 @@ Cloud Hypervisor VM's vsock connection *did* survive the identical pause/resume/
 the same client code, so this looks like a Firecracker vsock characteristic rather than an ephemera
 bug, but it's not something this project has a fix for.
 
+## Warm VM pools
+
+A pool keeps `size` VMs booted from a template sitting `Paused`, ready to be handed out on `claim` in
+a fraction of a full `create`'s time instead of a full boot:
+
+```bash
+sudo /usr/local/bin/ephemera --config /etc/ephemera.toml pool create --spec examples/pool.json
+sudo /usr/local/bin/ephemera --config /etc/ephemera.toml pool list
+sudo /usr/local/bin/ephemera --config /etc/ephemera.toml pool get my-pool
+```
+
+Pool spec (`template` is a normal `CreateVmRequest` — its `name`/`ttl_seconds` are ignored for pool
+members, which must never expire on their own while sitting idle):
+
+```json
+{
+  "name": "my-pool",
+  "size": 4,
+  "template": {
+    "name": "ignored",
+    "backend": "qemu",
+    "image": "/var/lib/ephemera/images/ubuntu-agent.qcow2",
+    "vcpus": 2,
+    "memory_mib": 2048,
+    "network": {"mode": "none"},
+    "agent": {"enabled": true, "port": 17777}
+  }
+}
+```
+
+Claim one through REST against a running `ephemera serve` daemon — the recommended way, since a
+claim's own backfill-the-pool-back-up work runs as a background task inside that long-lived process:
+
+```bash
+curl -sS -X POST http://127.0.0.1:7788/v1/pools/my-pool/claim \
+  -H 'content-type: application/json' \
+  -d '{"name": "job-123", "ttl_seconds": 900}' | jq
+```
+
+`ephemera pool claim <name>` also exists on the CLI, but as a **one-shot process** it exits right
+after printing the claimed VM — which can take its own backfill-replenishment task down with it
+mid-flight before the process exits. `ephemera pool create` avoids this by blocking until the pool is
+genuinely full before its own process exits; `pool claim` deliberately doesn't, to keep a claim fast.
+A separately-running `ephemera serve` daemon's reaper independently tops up every pool on its own
+schedule regardless of which process's claim under-filled it, so pool health converges either way —
+but for a claim's *own* immediate replenishment to be reliable, use REST against a running daemon.
+
+Every pool member is verified genuinely ready — not just "a process exists" — before being paused: a
+real bug found on real hardware pausing a member immediately after `create()` returns (before the
+guest had even finished booting, let alone started its guest-agent) meant a "warm" member was actually
+frozen mid-boot, so resuming it on claim still had to finish booting before `exec` worked at all,
+defeating the point. Backfill now waits for the guest agent to answer a ping before pausing.
+
+Verified on real hardware (`scripts/test-warm-pool.sh`): a pool backfills to size on its own, a REST
+claim is dramatically faster than a plain create (real numbers observed: ~0.2–0.5s vs. ~4–17s), the
+claimed VM works immediately (`exec` succeeds right away), the pool tops itself back up unasked after
+each claim, two claims in a row hand out two different VMs, and `pool delete` cleans up every member
+it still owns with no leftover VMs or processes.
+
 ## Build an image like a small virt-builder
 
 ```bash
@@ -400,13 +459,24 @@ GET    /metrics
 POST   /v1/vms
 GET    /v1/vms
 GET    /v1/vms/{uuid}
+POST   /v1/vms/{uuid}/start
 POST   /v1/vms/{uuid}/stop
 POST   /v1/vms/{uuid}/pause
 POST   /v1/vms/{uuid}/resume
 POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
+POST   /v1/pools
+GET    /v1/pools
+GET    /v1/pools/{name}
+DELETE /v1/pools/{name}
+POST   /v1/pools/{name}/claim
 ```
+
+`GET /v1/vms?name=<name>` exact-matches on `VmRecord.name` server-side. `POST /v1/vms/{uuid}/start`
+relaunches a `Stopped` VM from its existing disk/seed, skipping the image-clone/cloud-init/token-inject
+work `create` does — for a name-keyed register-then-start caller that already has a VM on disk it just
+needs running again.
 
 `GET /metrics` returns Prometheus text-exposition-format gauges: `ephemera_vms_total{status="..."}`,
 `ephemera_vms_by_backend{backend="..."}`, and `ephemera_vms_agent_enabled` — point a Prometheus
@@ -563,7 +633,7 @@ assigned the same vsock CID.
 
 1. **Firecracker jailer backend** — chroot, uid/gid isolation, cgroups, resource limits.
 2. **Network namespaces** — one namespace per VM, veth/TAP, nftables, DHCP/IPAM.
-3. **Snapshots** — full VM state + disk snapshots per backend, and warm VM pools (pre-created paused VMs) for sub-second job start.
+3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
 5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
 6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).

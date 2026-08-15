@@ -59,7 +59,13 @@ enum PoolCommand {
     Create { #[arg(long)] spec: PathBuf },
     List,
     Get { name: String },
-    /// Claim one ready VM from the pool (backfill happens automatically).
+    /// Claim one ready VM from the pool. Replenishment is fired off as a
+    /// background task so this command stays fast, which means it only
+    /// reliably completes if `ephemera serve` is already running against
+    /// the same state_dir — this one-shot process exits right after
+    /// printing the claimed VM, taking any still-in-flight replenishment
+    /// down with it. Prefer `POST /v1/pools/{name}/claim` against a running
+    /// `serve` daemon for guaranteed backfill.
     Claim {
         name: String,
         #[arg(long)]

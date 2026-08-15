@@ -1,0 +1,13 @@
+{
+  "name": "my-pool",
+  "size": 4,
+  "template": {
+    "name": "ignored",
+    "backend": "qemu",
+    "image": "/var/lib/ephemera/images/ubuntu-agent.qcow2",
+    "vcpus": 2,
+    "memory_mib": 2048,
+    "network": {"mode": "none"},
+    "agent": {"enabled": true, "port": 17777}
+  }
+}

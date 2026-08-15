@@ -21,6 +21,14 @@ const FIRST_GUEST_CID: u32 = 3;
 
 const GRACEFUL_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a VM may sit in `Creating` status before `reconcile()` assumes
+/// its creating process crashed and reclaims it. Generous on purpose —
+/// nothing in a normal `create()` should take anywhere near this long, even
+/// under load (the slowest real path observed, a non-reflinkable Firecracker
+/// raw-disk clone, took under a minute) — the cost of guessing wrong is a
+/// legitimately-slow create getting cut off, so this errs long.
+const STUCK_CREATING_GRACE: Duration = Duration::seconds(300);
+
 pub fn backend(kind: BackendKind) -> Result<Box<dyn VmBackend>> {
     Ok(match kind {
         BackendKind::Qemu => Box::new(ephemera_qemu::QemuBackend),
@@ -325,24 +333,59 @@ impl VmManager {
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<()> {
-        let vm = self.get(id).await?;
-        if vm.status == VmStatus::Running { let _ = self.stop(id).await; }
+        let mut vm = self.get(id).await?;
+        // A Paused VM is not "already stopped" — its process is fully
+        // alive with vCPUs suspended (real bug found on real hardware: a
+        // warm pool's never-claimed, still-Paused members were getting
+        // their workspace/disk deleted out from under a live QEMU process,
+        // because this only checked for Running, leaking an orphaned
+        // process on every `delete_pool` and every pool-member cleanup).
+        // `pid.is_some()` is the right test for "there's a process to kill"
+        // regardless of which of those two statuses got it there.
+        if vm.pid.is_some() {
+            vm = self.stop(id).await.context("stopping VM before delete")?;
+        }
+        // Defense in depth: `stop()` already falls back from graceful
+        // shutdown to a waited SIGTERM/SIGKILL, so this should never fire —
+        // but if it somehow does, refuse to reclaim the disk out from under
+        // a process that's still actually running, rather than silently
+        // deleting it and leaking an untracked orphan (the original shape
+        // of the bug above, one layer deeper).
+        if let Some(pid) = vm.pid {
+            if process::process_alive(pid).await {
+                bail!("refusing to delete {id}: pid {pid} is still alive after stop");
+            }
+        }
         let vm = self.store.remove(id).await?.context("VM vanished")?;
         if vm.workspace.exists() { fs::remove_dir_all(vm.workspace)?; }
         Ok(())
     }
 
     pub async fn reconcile(&self) -> Result<()> {
-        for mut vm in self.store.list().await {
+        let now = Utc::now();
+        for vm in self.store.list().await {
             if vm.status == VmStatus::Running {
                 if let Some(pid) = vm.pid {
                     if !process::process_alive(pid).await {
+                        let mut vm = vm;
                         vm.status = VmStatus::Stopped;
                         vm.pid = None;
                         if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
                         self.store.update(vm).await?;
                     }
                 }
+            } else if vm.status == VmStatus::Creating && now - vm.created_at > STUCK_CREATING_GRACE {
+                // `create()` sets this placeholder's status to Running or
+                // Failed as its very last step — a record still Creating
+                // this long after `created_at` means the process running
+                // that `create()` call was killed or crashed mid-flight
+                // (real trigger: `ephemera serve` killed while a pool
+                // backfill's `create()` was in progress) before it could
+                // reach either outcome. Nothing else will ever finish or
+                // clean up this placeholder, so reclaim it here rather than
+                // leave permanent litter in the store.
+                tracing::warn!(vm=%vm.id, "cleaning up a VM stuck in Creating status — its creating process likely crashed");
+                let _ = self.delete(vm.id).await;
             }
         }
         Ok(())
@@ -499,6 +542,23 @@ impl VmManager {
             req.name = format!("{name}-pool-{}", Uuid::new_v4());
             req.ttl_seconds = None; // a paused pool member must never expire on its own
             let vm = self.create(req).await.context("creating pool member")?;
+
+            // `create()` returns as soon as the VMM process is spawned, long
+            // before the guest OS has finished booting — pausing right here
+            // would freeze it mid-boot, before its guest-agent has even
+            // started. Confirmed on real hardware: a member paused this
+            // early comes back from `claim`'s resume still mid-boot, and
+            // `exec` fails (connection reset/timeout) for as long as the
+            // boot has left to run — the exact opposite of what a *warm*
+            // pool is for. Wait for the agent to actually answer a ping
+            // first, so a paused member is a genuinely finished, ready VM.
+            if vm.request.agent.as_ref().is_some_and(|a| a.enabled) {
+                if let Err(e) = wait_for_agent_ready(&vm).await {
+                    let _ = self.delete(vm.id).await;
+                    return Err(e).context("waiting for new pool member's guest agent to become ready");
+                }
+            }
+
             let paused = match self.pause(vm.id).await {
                 Ok(paused) => paused,
                 Err(e) => {
@@ -518,6 +578,31 @@ impl VmManager {
                 return Ok(());
             }
         }
+    }
+}
+
+/// How long a pool backfill will wait for a freshly-created member's guest
+/// agent to answer a ping before giving up. Generous on purpose — the
+/// slowest real boot observed this session (a whole-disk-extracted
+/// Firecracker rootfs hitting systemd's local-fs.target timeout) took
+/// ~140s; ordinary QEMU boots are much faster, but this errs long rather
+/// than abandon a legitimately-slow-but-fine boot.
+const POOL_MEMBER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Polls the guest agent with `Ping` until it answers or
+/// `POOL_MEMBER_READY_TIMEOUT` elapses. See `backfill_pool`'s call site for
+/// why this matters: pausing a pool member before its agent is reachable
+/// freezes it mid-boot, which is not "ready," just "created."
+async fn wait_for_agent_ready(vm: &VmRecord) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + POOL_MEMBER_READY_TIMEOUT;
+    loop {
+        if ephemera_vsock_client::ping(vm, std::time::Duration::from_secs(5)).await.is_ok() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("guest agent on {} never became reachable within {POOL_MEMBER_READY_TIMEOUT:?}", vm.id);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 

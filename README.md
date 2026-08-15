@@ -255,6 +255,26 @@ sudo /usr/local/bin/ephemera --config /etc/ephemera.toml create \
 
 Firecracker does not use BIOS/UEFI in this flow. The request supplies the Linux kernel and the manager supplies a raw block rootfs.
 
+## Auto backend selection
+
+Set `"backend": "auto"` and the manager picks a concrete backend for you, resolved once at the very
+start of `create` (the resolved value — never `"auto"` — is what's persisted and returned):
+
+1. **Firecracker** if the request has a `kernel`, or `firecracker_kernel` is set in the config — the
+   fastest microVM start when a direct-boot kernel is available.
+2. otherwise **Cloud Hypervisor** if the request has a `kernel`/`firmware`, or
+   `cloud_hypervisor_firmware` is set in the config.
+3. otherwise **QEMU** — the only one of the three that boots from just a disk image, via its own
+   BIOS/UEFI, with no kernel or firmware required.
+
+```json
+{ "name": "auto-example", "backend": "auto", "image": "/var/lib/ephemera/images/ubuntu.qcow2", "...": "..." }
+```
+
+Verified on real hardware (`scripts/test-auto-backend.sh`): all three resolution paths actually boot
+the chosen backend and answer over vsock, not just that `resolve_backend` returns the right enum
+value in isolation.
+
 ## Pause, resume, and exec
 
 ```bash
@@ -340,6 +360,7 @@ Endpoints:
 
 ```text
 GET    /healthz
+GET    /metrics
 POST   /v1/vms
 GET    /v1/vms
 GET    /v1/vms/{uuid}
@@ -350,6 +371,10 @@ POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
 ```
+
+`GET /metrics` returns Prometheus text-exposition-format gauges: `ephemera_vms_total{status="..."}`,
+`ephemera_vms_by_backend{backend="..."}`, and `ephemera_vms_agent_enabled` — point a Prometheus
+`scrape_config` at it directly, no exporter needed.
 
 Create through REST:
 
@@ -368,6 +393,10 @@ curl -sS http://127.0.0.1:7788/v1/vms/<uuid>/agent \
 ```
 
 ## VM JSON contract
+
+`backend` is one of `"qemu"`, `"cloud-hypervisor"`, `"firecracker"`, or `"auto"` (see "Auto backend
+selection" above — the persisted/returned record always shows the resolved concrete backend, never
+`"auto"`).
 
 ```json
 {
@@ -484,12 +513,13 @@ assigned the same vsock CID.
 5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
 6. **Policy** — max vCPU/RAM/disk/TTL, allowed VMMs, allowed images, allowed networking.
 7. **Auth** — mTLS/OIDC, RBAC, tenant IDs and audit events, and an authenticated guest-agent protocol (today's vsock agent trusts any caller that can reach the VM's CID).
-8. **Observability** — Prometheus metrics, tracing, per-VM boot timing and failure reasons.
+8. **Observability** — tracing, per-VM boot timing and failure reasons (a basic Prometheus `/metrics` endpoint — VM counts by status/backend, agent-enabled count — is already implemented; see the REST API section).
 9. **Kubernetes CRD/operator** — `DisposableVM` CRD backed by node-local daemonsets (`ephemera-kube`).
 10. **Distributed node-agent** — `ephemera-agent` (the per-*host* one, not `ephemera-guest-agent`) running per hypervisor host, reporting to a central `ephemera-scheduler`.
-11. **"auto" backend selection** — pick QEMU/Cloud Hypervisor/Firecracker automatically based on what the request needs, instead of requiring an explicit `backend`.
-12. **Scheduler placement** — NUMA awareness, CPU pinning, hugepages and GPU/VFIO assignment.
-13. **Windows path** — QEMU/Cloud Hypervisor only; UEFI, virtio-win injection, sysprep and unattend support.
+11. **Scheduler placement** — NUMA awareness, CPU pinning, hugepages and GPU/VFIO assignment.
+12. **Windows path** — QEMU/Cloud Hypervisor only; UEFI, virtio-win injection, sysprep and unattend support.
+
+"auto" backend selection is already implemented — see "Auto backend selection" above.
 
 ## Important limitations in this MVP
 

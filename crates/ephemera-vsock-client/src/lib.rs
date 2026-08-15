@@ -39,6 +39,7 @@ pub async fn call(vm: &VmRecord, request: AgentRequest, timeout: Duration) -> Re
                 let socket = vm.workspace.join("vsock.sock");
                 uds_proxy_call(&socket, port, &request).await
             }
+            BackendKind::Auto => bail!("VM has an unresolved BackendKind::Auto — this is a bug, backend selection must happen before a VM is persisted"),
         }
     })
     .await

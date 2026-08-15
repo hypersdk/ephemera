@@ -197,6 +197,7 @@ pub async fn clone_for_vm(cfg: &Config, base: &Path, backend: BackendKind, out: 
                 ]).await?;
             }
         }
+        BackendKind::Auto => bail!("VM has an unresolved BackendKind::Auto — this is a bug, backend selection must happen before cloning its disk"),
     }
     if let Some(size) = size_gib {
         run_checked(&cfg.qemu_img_binary, &[

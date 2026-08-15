@@ -12,6 +12,11 @@ pub enum BackendKind {
     Qemu,
     CloudHypervisor,
     Firecracker,
+    /// Resolved to a concrete backend by `ephemera_scheduler::resolve_backend`
+    /// as the very first step of `VmManager::create` — never persisted, and
+    /// every other function taking a `BackendKind` (the backend dispatcher,
+    /// image cloning, ...) assumes it never sees this variant.
+    Auto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

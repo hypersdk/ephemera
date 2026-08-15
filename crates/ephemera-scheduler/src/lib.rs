@@ -20,11 +20,34 @@ const FIRST_GUEST_CID: u32 = 3;
 
 const GRACEFUL_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub fn backend(kind: BackendKind) -> Box<dyn VmBackend> {
-    match kind {
+pub fn backend(kind: BackendKind) -> Result<Box<dyn VmBackend>> {
+    Ok(match kind {
         BackendKind::Qemu => Box::new(ephemera_qemu::QemuBackend),
         BackendKind::CloudHypervisor => Box::new(ephemera_cloud_hypervisor::CloudHypervisorBackend),
         BackendKind::Firecracker => Box::new(ephemera_firecracker::FirecrackerBackend),
+        BackendKind::Auto => bail!("VM has an unresolved BackendKind::Auto — this is a bug, backend selection must happen before dispatch"),
+    })
+}
+
+/// Picks a concrete backend for `BackendKind::Auto`, preferring Firecracker
+/// (fastest microVM start) when a direct-boot kernel is available, then
+/// Cloud Hypervisor when a kernel or firmware is available, falling back to
+/// QEMU (works with just a disk image, no kernel/firmware required — the
+/// only one of the three that boots via its own BIOS/UEFI). Any non-`Auto`
+/// request passes through unchanged. Called once, as the very first step of
+/// `create()`, before the resolved kind is ever persisted or dispatched on.
+pub fn resolve_backend(req: &CreateVmRequest, cfg: &Config) -> BackendKind {
+    if req.backend != BackendKind::Auto {
+        return req.backend;
+    }
+    let firecracker_ok = req.kernel.is_some() || cfg.firecracker_kernel.is_some();
+    let cloud_hypervisor_ok = req.kernel.is_some() || req.firmware.is_some() || cfg.cloud_hypervisor_firmware.is_some();
+    if firecracker_ok {
+        BackendKind::Firecracker
+    } else if cloud_hypervisor_ok {
+        BackendKind::CloudHypervisor
+    } else {
+        BackendKind::Qemu
     }
 }
 
@@ -40,7 +63,11 @@ impl VmManager {
         Ok(Arc::new(Self { cfg, store }))
     }
 
-    pub async fn create(self: &Arc<Self>, req: CreateVmRequest) -> Result<VmRecord> {
+    pub async fn create(self: &Arc<Self>, mut req: CreateVmRequest) -> Result<VmRecord> {
+        // Resolve BackendKind::Auto before anything else — everything below
+        // (the disk filename, the persisted record, the launch dispatch)
+        // assumes a concrete backend and must never see Auto.
+        req.backend = resolve_backend(&req, &self.cfg);
         if !req.image.exists() { bail!("base image does not exist: {}", req.image.display()); }
         let id = Uuid::new_v4();
         let workspace = self.cfg.state_dir.join("instances").join(id.to_string());
@@ -104,7 +131,7 @@ impl VmManager {
                 guest_cid,
                 vsock_socket,
             };
-            let launch = backend(req.backend).launch(&self.cfg, &req, &ctx).await?;
+            let launch = backend(req.backend)?.launch(&self.cfg, &req, &ctx).await?;
             record.pid = Some(launch.pid);
             record.control_socket = launch.control_socket;
             record.status = VmStatus::Running;
@@ -135,7 +162,10 @@ impl VmManager {
                 // Ask the VMM to shut the guest down cleanly first; only
                 // force-kill if it doesn't exit within the grace period (or
                 // the VMM's control channel didn't respond at all).
-                let asked_nicely = backend(vm.backend).graceful_shutdown(&self.cfg, &vm).await.is_ok();
+                let asked_nicely = match backend(vm.backend) {
+                    Ok(b) => b.graceful_shutdown(&self.cfg, &vm).await.is_ok(),
+                    Err(_) => false,
+                };
                 let exited = asked_nicely && process::wait_for_exit(pid, (GRACEFUL_SHUTDOWN_WAIT.as_millis() / 100) as u32).await;
                 if !exited && process::process_alive(pid).await {
                     process::terminate_pid(pid).await?;
@@ -151,7 +181,7 @@ impl VmManager {
 
     pub async fn pause(&self, id: Uuid) -> Result<VmRecord> {
         let mut vm = self.get(id).await?;
-        backend(vm.backend).pause(&self.cfg, &vm).await?;
+        backend(vm.backend)?.pause(&self.cfg, &vm).await?;
         vm.status = VmStatus::Paused;
         self.store.update(vm.clone()).await?;
         Ok(vm)
@@ -159,7 +189,7 @@ impl VmManager {
 
     pub async fn resume(&self, id: Uuid) -> Result<VmRecord> {
         let mut vm = self.get(id).await?;
-        backend(vm.backend).resume(&self.cfg, &vm).await?;
+        backend(vm.backend)?.resume(&self.cfg, &vm).await?;
         vm.status = VmStatus::Running;
         self.store.update(vm.clone()).await?;
         Ok(vm)
@@ -210,5 +240,82 @@ impl VmManager {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ephemera_core::model::NetworkSpec;
+
+    fn req(backend: BackendKind, kernel: Option<&str>, firmware: Option<&str>) -> CreateVmRequest {
+        CreateVmRequest {
+            name: "fixture".into(),
+            backend,
+            image: "/tmp/base.qcow2".into(),
+            vcpus: 1,
+            memory_mib: 512,
+            disk_size_gib: None,
+            kernel: kernel.map(Into::into),
+            initrd: None,
+            firmware: firmware.map(Into::into),
+            kernel_args: None,
+            network: NetworkSpec::None,
+            cloud_init: None,
+            ttl_seconds: None,
+            extra_args: vec![],
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn non_auto_backend_passes_through_unchanged() {
+        let cfg = Config::default();
+        for backend in [BackendKind::Qemu, BackendKind::CloudHypervisor, BackendKind::Firecracker] {
+            let r = req(backend, None, None);
+            assert_eq!(resolve_backend(&r, &cfg), backend);
+        }
+    }
+
+    #[test]
+    fn auto_prefers_firecracker_when_request_supplies_a_kernel() {
+        let cfg = Config::default();
+        let r = req(BackendKind::Auto, Some("/boot/vmlinux"), None);
+        assert_eq!(resolve_backend(&r, &cfg), BackendKind::Firecracker);
+    }
+
+    #[test]
+    fn auto_prefers_firecracker_when_config_has_a_default_kernel() {
+        let mut cfg = Config::default();
+        cfg.firecracker_kernel = Some("/boot/vmlinux".into());
+        let r = req(BackendKind::Auto, None, None);
+        assert_eq!(resolve_backend(&r, &cfg), BackendKind::Firecracker);
+    }
+
+    #[test]
+    fn auto_falls_back_to_cloud_hypervisor_when_only_firmware_is_available() {
+        let cfg = Config::default();
+        let r = req(BackendKind::Auto, None, Some("/usr/share/hypervisor-fw"));
+        assert_eq!(resolve_backend(&r, &cfg), BackendKind::CloudHypervisor);
+    }
+
+    #[test]
+    fn auto_falls_back_to_cloud_hypervisor_when_config_has_default_firmware() {
+        let mut cfg = Config::default();
+        cfg.cloud_hypervisor_firmware = Some("/usr/share/hypervisor-fw".into());
+        let r = req(BackendKind::Auto, None, None);
+        assert_eq!(resolve_backend(&r, &cfg), BackendKind::CloudHypervisor);
+    }
+
+    #[test]
+    fn auto_falls_back_to_qemu_with_nothing_configured() {
+        let cfg = Config::default();
+        let r = req(BackendKind::Auto, None, None);
+        assert_eq!(resolve_backend(&r, &cfg), BackendKind::Qemu);
+    }
+
+    #[test]
+    fn backend_rejects_unresolved_auto() {
+        assert!(backend(BackendKind::Auto).is_err());
     }
 }

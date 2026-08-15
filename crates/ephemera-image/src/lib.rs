@@ -3,6 +3,7 @@
 
 pub mod catalog;
 pub mod cloudinit;
+pub mod storage;
 
 use anyhow::{bail, Context, Result};
 use ephemera_core::{config::Config, model::BackendKind, process::run_checked};

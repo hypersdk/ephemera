@@ -1135,6 +1135,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

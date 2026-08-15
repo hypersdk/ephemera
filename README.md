@@ -83,6 +83,7 @@ for that step — see "Build an image" below.
 - Raw reflink copies for Firecracker / Cloud Hypervisor when the host filesystem supports reflinks.
 - Raw conversion fallback through `qemu-img`.
 - Optional disk growth.
+- Pluggable storage backends beyond the qcow2/raw defaults above: LVM thin snapshots and NBD-exported disks (both verified booting real guests), plus Ceph RBD (implemented, unverified — see "Storage backends" below).
 - cloud-init NoCloud seed disk generation.
 - TAP interface creation and optional Linux bridge attachment.
 - macvtap networking (QEMU and Cloud Hypervisor) — a VM's own MAC directly on a parent link, no bridge.
@@ -585,6 +586,68 @@ verifiable entry; creating a VM by catalog name actually resolves and boots the 
 confirmed by actually trying to boot); a plain literal path still works unchanged; `GET
 /v1/images/catalog` correctly reports `signature_valid: true`/`false` for the two cases.
 
+## Storage backends
+
+By default a VM's disk is provisioned the same way it always has been: a
+qcow2 copy-on-write overlay for QEMU, a reflinked-or-copied raw file for
+Cloud Hypervisor/Firecracker (see "What is implemented" above). Setting
+`storage` on a create request switches to one of three alternative
+provisioning backends instead — `ephemera_core::model::StorageBackend`,
+implemented in `ephemera_image::storage`:
+
+- **`lvm-thin`** — `image` must be a `/dev/<vg>/<lv>` path to an existing
+  LVM thin logical volume (in a thin pool). A fresh thin *snapshot* LV is
+  created per VM (`lvcreate --snapshot`) and handed to the VMM directly as a
+  raw block device — real copy-on-write at the block layer, and near-instant
+  regardless of image size. Verified end to end on real hardware: create →
+  a genuinely new `/dev/<vg>/eph-<id>` snapshot LV appears → the guest boots
+  off it and answers `exec` → `delete` removes the snapshot LV, `stop` alone
+  leaves it in place (same as the disk file is left in place for every other
+  backend). Not supported under the Firecracker jailer, since its
+  chroot/hardlink resource-placement model doesn't extend to a shared block
+  device — use direct (non-jailed) Firecracker, QEMU, or Cloud Hypervisor.
+  **Real bug found and fixed while testing this**: LVM sets a persistent
+  "activation skip" flag on every new thin snapshot by default; without
+  `--setactivationskip n` on the `lvcreate`, the following `lvchange -ay`
+  exits 0 but silently activates nothing, and the VM fails to boot with a
+  "device does not exist" error. There's also a real (if narrow) udev race —
+  `lvchange -ay` returns as soon as the kernel dm target is live, before
+  udev has necessarily finished creating the `/dev/<vg>/<lv>` symlink — so
+  provisioning polls for that symlink for up to 5s rather than trusting the
+  command's exit status alone.
+- **`nbd`** — QEMU only (QEMU has a native `nbd:` block client; Cloud
+  Hypervisor and Firecracker don't). The disk is the same disposable qcow2
+  overlay as the default backend, but it's exported over NBD via a
+  `qemu-nbd` subprocess this VM owns (over a UNIX socket, not a TCP port)
+  instead of being opened directly as a local file — the same client/server
+  split real remote/shared NBD storage uses, without needing a separate
+  storage host to prove the mechanism end to end. Verified on real hardware:
+  the exporting `qemu-nbd` process is a real, findable pid; the guest boots
+  over the NBD attachment and answers `exec`; `delete` kills the export
+  (`stop` alone leaves it running, so a later `start` can reattach). **Real
+  bug found and fixed while testing this**: injecting the guest-agent token
+  into the disk (via `guestkit`, which does its own independent qemu-nbd
+  mount) after this VM's own `qemu-nbd --persistent` export was already
+  running raced its write lock and failed with "Failed to get 'write' lock".
+  Fixed by injecting the token before the export starts, not after.
+- **`ceph-rbd`** — implemented against the real `rbd` CLI (`rbd clone
+  <pool>/<image>@ephemera-base ...`) and QEMU's native `rbd:` block driver
+  (QEMU only; Cloud Hypervisor/Firecracker have no built-in Ceph client),
+  but **never exercised against a real Ceph cluster** — none was available
+  in this project's test environment, unlike every other backend and
+  feature in this README. Treat it as implemented but unverified. It also
+  doesn't support automatic guest-agent token injection (`guestkit` needs a
+  local file or block device to mount, not an arbitrary `rbd:` URI) — that
+  combination fails fast with a clear error rather than attempting it.
+
+`storage` defaults to unset (`Default`) on every create request — nothing
+above changes any existing behavior unless a caller opts in.
+
+See `scripts/test-storage-backends.sh` for the real-hardware regression test
+(`lvm-thin` and `nbd`; it does not attempt `ceph-rbd`, for the reason
+above) — it also sets up a loopback-backed thin pool from scratch if you
+don't already have one, see the script's own `--help` for that recipe.
+
 ## REST API
 
 Start the server:
@@ -709,7 +772,8 @@ selection" above — the persisted/returned record always shows the resolved con
   },
   "agent": {"enabled": true, "port": 17777},
   "ttl_seconds": 600,
-  "extra_args": []
+  "extra_args": [],
+  "storage": "default"
 }
 ```
 
@@ -717,6 +781,9 @@ selection" above — the persisted/returned record always shows the resolved con
 have `ephemera-guest-agent` installed and enabled (see "Build an image" above). `agent.port` is the
 AF_VSOCK port the guest listens on (not a host TCP port); it defaults to `17777` and rarely needs
 changing, since each VM already gets its own host-unique vsock CID.
+
+`storage` is one of `"default"` (the implicit default when the field is omitted entirely — qcow2/raw,
+exactly as before this existed), `"lvm-thin"`, `"nbd"`, or `"ceph-rbd"` — see "Storage backends" above.
 
 ### Networking modes
 
@@ -797,7 +864,7 @@ assigned the same vsock CID.
 1. **Firecracker jailer's own `--cgroup`/`--resource-limit` flags** — not wired up, but superseded in practice: every VM (all three backends, not just jailed Firecracker) already gets real cgroup v2 resource control (CPU/memory/IO/pids/cpuset, freeze/thaw, stats, PSI pressure) independent of the jailer — see "Resource control (cgroup v2)" above.
 2. **Network namespace policy** — one namespace per VM (veth + NAT + internal bridge) is already implemented and opt-in per VM (see "Network namespaces" above); still missing: nftables instead of one flat iptables MASQUERADE rule per VM, and real IPAM (subnets are derived deterministically from the VM id rather than tracked/reused, a documented theoretical-collision tradeoff).
 3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
-4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
+4. **Storage abstraction** — already implemented: qcow2 CoW overlay and raw reflink (the always-on defaults, per VMM backend), plus opt-in LVM thin snapshots and NBD-exported disks, both verified booting real guests on real hardware; see "Storage backends" below. Ceph RBD is implemented (real `rbd` CLI + QEMU's native `rbd:` driver) but unverified — no Ceph cluster was available to test against. Not done: NVMe-local as a distinct backend (a local raw file/block device already gets NVMe's real performance with no extra abstraction needed — reflink/LVM already cover that case).
 5. **Image catalog** — already implemented: named/checksummed/Ed25519-signed entries, distro/version/arch metadata (see "Image catalog & signing" above). Not done: a cosign/Sigstore option specifically, for shops standardized on that instead of this project's own signing scheme.
 6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).
 7. **Auth** — mTLS/OIDC, tenant IDs and audit events. Bearer-token REST auth/RBAC (admin/read-only) and a per-VM authenticated guest-agent protocol are already implemented; see "Auth / RBAC" and "Pause, resume, and exec" above.

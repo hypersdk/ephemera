@@ -307,12 +307,15 @@ mod tests {
                 ttl_seconds: None,
                 extra_args: vec![],
                 agent: None,
+                storage: Default::default(),
             },
             guest_cid: None,
             jail_path: None,
             vsock_socket: None,
             cgroup_path: None,
             netns: None,
+            lvm_lv: None,
+            nbd_pid: None,
         }
     }
 

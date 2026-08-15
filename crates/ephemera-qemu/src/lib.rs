@@ -18,6 +18,15 @@ const QMP_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct QemuBackend;
 
 pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<String>> {
+    // A `StorageBackend::Nbd` disk isn't opened as a local file at all — it's
+    // attached via QEMU's native nbd: block client against the qemu-nbd
+    // export this VM owns. Every other storage backend (including the
+    // Default qcow2 overlay) opens `ctx.disk` directly, just with a format
+    // that varies by backend (see `ephemera_image::storage::disk_format`).
+    let disk_drive = match &ctx.nbd_export {
+        Some(socket) => format!("file=nbd:unix:{},if=virtio,format=raw", socket.display()),
+        None => format!("file={},if=virtio,format={},cache=none,aio=native", path_arg(&ctx.disk), ctx.disk_format),
+    };
     let mut a = vec![
         "-enable-kvm".into(),
         "-machine".into(), "q35,accel=kvm".into(),
@@ -27,7 +36,7 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<Stri
         "-nodefaults".into(),
         "-display".into(), "none".into(),
         "-serial".into(), "stdio".into(),
-        "-drive".into(), format!("file={},if=virtio,format=qcow2,cache=none,aio=native", path_arg(&ctx.disk)),
+        "-drive".into(), disk_drive,
     ];
 
     if let Some(seed) = &ctx.seed_disk {

@@ -27,6 +27,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub jailer: JailerConfig,
     pub catalog: CatalogConfig,
+    pub storage: StorageConfig,
 }
 
 impl Default for Config {
@@ -50,7 +51,30 @@ impl Default for Config {
             auth: AuthConfig::default(),
             jailer: JailerConfig::default(),
             catalog: CatalogConfig::default(),
+            storage: StorageConfig::default(),
         }
+    }
+}
+
+/// Settings for `StorageBackend::CephRbd` (see `model::StorageBackend`) —
+/// unused by every other storage backend, which need no configuration at
+/// all (LVM's volume group is read off the request's device path, NBD needs
+/// nothing beyond `qemu-nbd` being installed). Ceph RBD support has not
+/// been exercised against a real cluster in this project's own testing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Ceph client identity used for both `rbd` CLI calls and QEMU's `rbd:`
+    /// URI (`id=`, without the `client.` prefix).
+    pub ceph_user: String,
+    /// Path to `ceph.conf`. `None` lets the `rbd` CLI and QEMU fall back to
+    /// their own default search paths (`/etc/ceph/ceph.conf`).
+    pub ceph_conf: Option<PathBuf>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self { ceph_user: "admin".into(), ceph_conf: None }
     }
 }
 

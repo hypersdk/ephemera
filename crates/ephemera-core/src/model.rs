@@ -73,6 +73,44 @@ pub struct PortForward {
 }
 fn default_tcp() -> String { "tcp".into() }
 
+/// Where and how a VM's writable disk is actually provisioned, independent
+/// of which VMM backend boots it. `Default` (the empty/unset request field)
+/// keeps today's per-VMM behavior unchanged: a qcow2 copy-on-write overlay
+/// for QEMU, a reflinked-or-copied raw file for Cloud Hypervisor/Firecracker.
+/// See `ephemera_image::storage` for how each variant is actually
+/// provisioned and torn down.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageBackend {
+    #[default]
+    Default,
+    /// `request.image` must be the path to an existing LVM thin logical
+    /// volume block device (e.g. `/dev/vg0/base-image`), itself backed by a
+    /// thin pool. A new thin snapshot LV is created per VM and handed to
+    /// the VMM directly as a raw block device: near-instant, real
+    /// copy-on-write at the block layer, no filesystem/reflink involved.
+    /// Not supported under the Firecracker jailer — its chroot/hardlink
+    /// resource-placement model doesn't extend to shared block devices; use
+    /// direct (non-jailed) Firecracker, QEMU, or Cloud Hypervisor instead.
+    LvmThin,
+    /// QEMU only. The per-VM disk is a normal qcow2 CoW overlay, exported
+    /// over NBD via a `qemu-nbd` subprocess this VM owns (over a UNIX
+    /// socket, not a TCP port) instead of being opened directly as a local
+    /// file by QEMU — the same client/server split real remote/shared NBD
+    /// storage uses, without requiring a separate storage host to exist in
+    /// order to prove the mechanism end to end.
+    Nbd,
+    /// Ceph RBD. `request.image` is a `pool/image` reference to an existing
+    /// RBD image; a snapshot on it named `ephemera-base` must already exist
+    /// and be protected (`rbd snap protect`) for the per-VM clone to work.
+    /// Implemented against the real `rbd` CLI and QEMU's native `rbd:`
+    /// block driver, but — unlike every other backend in this project —
+    /// has never been exercised against a real Ceph cluster, because none
+    /// was available in this environment. Treat as implemented but
+    /// unverified.
+    CephRbd,
+}
+
 /// Enables the in-guest vsock agent (ping/exec/shutdown, no SSH needed).
 /// `port` is the AF_VSOCK port the guest listens on, not a host TCP port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +177,8 @@ pub struct CreateVmRequest {
     pub extra_args: Vec<String>,
     #[serde(default)]
     pub agent: Option<AgentSpec>,
+    #[serde(default)]
+    pub storage: StorageBackend,
 }
 fn default_vcpus() -> u8 { 2 }
 fn default_memory() -> u64 { 2048 }
@@ -190,6 +230,17 @@ pub struct VmRecord {
     /// `ephemera_network::netns`. `None` for every other networking mode.
     #[serde(default)]
     pub netns: Option<String>,
+    /// `StorageBackend::LvmThin` only: the thin snapshot LV device path
+    /// (`/dev/<vg>/eph-<id>`) created for this VM, so `VmManager::delete`
+    /// can `lvremove` it regardless of what `request.storage` says by the
+    /// time the VM is deleted.
+    #[serde(default)]
+    pub lvm_lv: Option<PathBuf>,
+    /// `StorageBackend::Nbd` only: pid of the `qemu-nbd` subprocess serving
+    /// this VM's disk over `<workspace>/nbd.sock`, kept alive across
+    /// stop/start (like the disk file itself) and reaped only on delete.
+    #[serde(default)]
+    pub nbd_pid: Option<u32>,
 }
 
 /// A named template for a warm pool: `size` VMs matching `template` are

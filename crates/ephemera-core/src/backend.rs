@@ -37,6 +37,17 @@ pub struct LaunchContext {
     /// Path for the VMM's vsock proxy UDS (Cloud Hypervisor/Firecracker
     /// only — QEMU exposes a real kernel vsock device and needs no proxy).
     pub vsock_socket: Option<PathBuf>,
+    /// Block format of `disk` as the VMM should open it: `"qcow2"` for a
+    /// QEMU CoW overlay (`StorageBackend::Default`), `"raw"` for every
+    /// other storage backend (a raw block device, an rbd: URI, or an NBD
+    /// export — see `ephemera_image::storage`) and for Cloud
+    /// Hypervisor/Firecracker's always-raw disks.
+    pub disk_format: String,
+    /// `StorageBackend::Nbd` only (QEMU): the `qemu-nbd` UNIX socket path
+    /// `disk` is actually served over. When set, the QEMU backend attaches
+    /// via `file=nbd:unix:<path>,format=raw` instead of opening `disk`
+    /// directly as a local file.
+    pub nbd_export: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

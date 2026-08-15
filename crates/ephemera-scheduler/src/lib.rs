@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use ephemera_core::{
     backend::{LaunchContext, VmBackend},
     config::Config,
-    model::{BackendKind, ClaimOverrides, CreateVmRequest, PoolRecord, PoolSpec, VmRecord, VmStatus},
+    model::{BackendKind, ClaimOverrides, CreateVmRequest, PoolRecord, PoolSpec, StorageBackend, VmRecord, VmStatus},
     process,
 };
 use ephemera_guest_protocol::AgentRequest;
@@ -239,7 +239,13 @@ impl VmManager {
         // alias string itself.
         req.image = ephemera_image::catalog::resolve(&self.cfg, &req.image).await.context("resolving image from catalog")?;
         validate_policy(&req, &self.cfg)?;
-        if !req.image.exists() { bail!("base image does not exist: {}", req.image.display()); }
+        // Every storage backend except CephRbd points `image` at a real
+        // filesystem entry (a file for Default/Nbd, a block device for
+        // LvmThin) — CephRbd's `image` is a `pool/image` reference with no
+        // local path to check at all.
+        if req.storage != StorageBackend::CephRbd && !req.image.exists() {
+            bail!("base image does not exist: {}", req.image.display());
+        }
         let id = Uuid::new_v4();
         let workspace = self.cfg.state_dir.join("instances").join(id.to_string());
         fs::create_dir_all(&workspace)?;
@@ -279,6 +285,8 @@ impl VmManager {
             vsock_socket: None,
             cgroup_path: None,
             netns: None,
+            lvm_lv: None,
+            nbd_pid: None,
         };
         // Deciding the CID and reserving it happen as one atomic, locked
         // operation in the store — see ephemera-storage::Store::insert_with_cid
@@ -288,11 +296,13 @@ impl VmManager {
         let guest_cid = record.guest_cid;
 
         let result: Result<()> = async {
-            ephemera_image::clone_for_vm(&self.cfg, &req.image, req.backend, &disk, req.disk_size_gib).await?;
-            if let Some(token) = req.agent.as_ref().and_then(|a| a.token.as_deref()) {
-                ephemera_image::inject_guest_agent_token(&disk, token).await
-                    .context("injecting guest-agent auth token into instance disk")?;
-            }
+            let agent_token = req.agent.as_ref().and_then(|a| a.token.as_deref());
+            let provisioned = ephemera_image::storage::provision(
+                &self.cfg, &req.image, req.backend, req.storage, &workspace, &disk, req.disk_size_gib, id, agent_token,
+            ).await.context("provisioning VM disk")?;
+            record.disk = provisioned.disk.clone();
+            record.lvm_lv = provisioned.lvm_lv.clone();
+            record.nbd_pid = provisioned.nbd_pid;
             let seed = match &req.cloud_init {
                 Some(ci) => Some(ephemera_image::cloudinit::build_seed(&self.cfg, &workspace, ci).await?),
                 None => None,
@@ -314,12 +324,14 @@ impl VmManager {
             let ctx = LaunchContext {
                 id,
                 workspace: workspace.clone(),
-                disk: disk.clone(),
+                disk: record.disk.clone(),
                 seed_disk: seed,
                 log_path: log_path.clone(),
                 network,
                 guest_cid,
                 vsock_socket,
+                disk_format: ephemera_image::storage::disk_format(req.backend, req.storage),
+                nbd_export: provisioned.nbd_export,
             };
             let launch = backend(req.backend)?.launch(&self.cfg, &req, &ctx).await?;
             record.pid = Some(launch.pid);
@@ -333,6 +345,10 @@ impl VmManager {
 
         if let Err(e) = result {
             if let Some(tap) = &record.tap_name { let _ = ephemera_network::cleanup(id, &req.network, tap, record.netns.as_deref()).await; }
+            // A later step (network prep, launch) can fail after the disk
+            // was already provisioned — don't leak the LV/qemu-nbd process.
+            if let Some(lv) = &record.lvm_lv { let _ = ephemera_image::storage::cleanup_lvm_lv(lv).await; }
+            if let Some(pid) = record.nbd_pid { let _ = ephemera_image::storage::cleanup_nbd(pid).await; }
             record.status = VmStatus::Failed;
             record.error = Some(format!("{e:#}"));
             self.store.update(record.clone()).await?;
@@ -361,7 +377,11 @@ impl VmManager {
         if vm.status == VmStatus::Running {
             return Ok(vm);
         }
-        if !vm.disk.exists() {
+        // A CephRbd disk is a `rbd:pool/image:...` URI, not a real
+        // filesystem path — there's nothing on the local filesystem to
+        // check `exists()` against. LvmThin (a block device) and Nbd (the
+        // local qcow2 file the export serves) both really do live on disk.
+        if vm.request.storage != StorageBackend::CephRbd && !vm.disk.exists() {
             bail!("cannot start {id}: disk no longer exists at {}", vm.disk.display());
         }
 
@@ -375,6 +395,10 @@ impl VmManager {
                 (Some(_), _) => Some(vm.workspace.join("vsock.sock")),
                 (None, _) => None,
             };
+            // `StorageBackend::Nbd`'s qemu-nbd export is left running across
+            // stop/start (see `VmRecord::nbd_pid`), so its socket is already
+            // there to reattach to — nothing to reprovision.
+            let nbd_export = (vm.request.storage == StorageBackend::Nbd).then(|| vm.workspace.join("nbd.sock"));
 
             let ctx = LaunchContext {
                 id,
@@ -385,6 +409,8 @@ impl VmManager {
                 network,
                 guest_cid: vm.guest_cid,
                 vsock_socket,
+                disk_format: ephemera_image::storage::disk_format(vm.backend, vm.request.storage),
+                nbd_export,
             };
             let launch = backend(vm.backend)?.launch(&self.cfg, &vm.request, &ctx).await?;
             vm.pid = Some(launch.pid);
@@ -494,6 +520,28 @@ impl VmManager {
             }
         }
         let vm = self.store.remove(id).await?.context("VM vanished")?;
+        // These three point at live state outside `workspace` (a
+        // still-active LV, a still-running qemu-nbd process, a Ceph clone)
+        // that only `delete` ever reclaims — `stop` deliberately leaves them
+        // alone, same as it leaves the disk file itself alone, so a stopped
+        // VM can be `start`ed again without reprovisioning storage.
+        if let Some(lv) = &vm.lvm_lv {
+            if let Err(e) = ephemera_image::storage::cleanup_lvm_lv(lv).await {
+                tracing::warn!(vm = %id, error = %e, "failed to remove LVM thin snapshot");
+            }
+        }
+        if let Some(pid) = vm.nbd_pid {
+            if let Err(e) = ephemera_image::storage::cleanup_nbd(pid).await {
+                tracing::warn!(vm = %id, error = %e, "failed to stop qemu-nbd export");
+            }
+        }
+        if vm.request.storage == StorageBackend::CephRbd {
+            if let Some(pool_image) = ephemera_image::storage::ceph_rbd_ref(&vm.disk) {
+                if let Err(e) = ephemera_image::storage::cleanup_ceph_rbd(&self.cfg, &pool_image).await {
+                    tracing::warn!(vm = %id, error = %e, "failed to remove Ceph RBD clone (unverified backend)");
+                }
+            }
+        }
         if vm.workspace.exists() { fs::remove_dir_all(vm.workspace)?; }
         // Firecracker-jailer VMs place resources under a separate chroot
         // tree (`cfg.jailer.chroot_base_dir`, not `state_dir`) that
@@ -777,6 +825,7 @@ mod tests {
             ttl_seconds: None,
             extra_args: vec![],
             agent: None,
+            storage: StorageBackend::Default,
         }
     }
 

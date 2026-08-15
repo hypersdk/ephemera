@@ -982,6 +982,7 @@ dependencies = [
  "async-trait",
  "ephemera-core",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1067,9 +1068,11 @@ name = "ephemera-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "ephemera-core",
  "libc",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]

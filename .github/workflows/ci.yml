@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      # ephemera-image depends on the sibling `guestkit` project via a
+      # relative path (../../../guestkit from crates/ephemera-image), so it
+      # has to land as an actual sibling directory here too, not nested
+      # inside this checkout.
+      - name: Checkout ephemera
+        uses: actions/checkout@v4
+        with:
+          path: ephemera
+
+      - name: Checkout guestkit (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: hypersdk/guestkit
+          path: guestkit
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ephemera
+
+      - name: cargo build --workspace
+        working-directory: ephemera
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test --workspace
+        working-directory: ephemera
+        run: cargo test --workspace
+
+      - name: cargo clippy (informational — not a merge gate yet)
+        working-directory: ephemera
+        run: cargo clippy --workspace --all-targets || true

@@ -142,3 +142,132 @@ impl Store {
         self.with_exclusive(move |m| m.remove(&id)).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use ephemera_core::model::{BackendKind, CreateVmRequest, NetworkSpec, VmStatus};
+    use std::collections::HashSet;
+
+    fn fixture_record(name: &str) -> VmRecord {
+        let id = Uuid::new_v4();
+        VmRecord {
+            id,
+            name: name.to_string(),
+            backend: BackendKind::Qemu,
+            status: VmStatus::Creating,
+            pid: None,
+            created_at: Utc::now(),
+            expires_at: None,
+            workspace: PathBuf::from("/tmp/does-not-matter"),
+            disk: PathBuf::from("/tmp/does-not-matter/root.qcow2"),
+            seed_disk: None,
+            tap_name: None,
+            control_socket: None,
+            log_path: PathBuf::from("/tmp/does-not-matter/console.log"),
+            error: None,
+            request: CreateVmRequest {
+                name: name.to_string(),
+                backend: BackendKind::Qemu,
+                image: PathBuf::from("/tmp/base.qcow2"),
+                vcpus: 1,
+                memory_mib: 512,
+                disk_size_gib: None,
+                kernel: None,
+                initrd: None,
+                firmware: None,
+                kernel_args: None,
+                network: NetworkSpec::None,
+                cloud_init: None,
+                ttl_seconds: None,
+                extra_args: vec![],
+                agent: None,
+            },
+            guest_cid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_get_list_remove_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::load(dir.path()).unwrap();
+        let vm = fixture_record("a");
+        let id = vm.id;
+
+        store.insert(vm.clone()).await.unwrap();
+        assert_eq!(store.get(id).await.unwrap().name, "a");
+        assert_eq!(store.list().await.len(), 1);
+
+        let removed = store.remove(id).await.unwrap();
+        assert_eq!(removed.unwrap().id, id);
+        assert!(store.get(id).await.is_none());
+        assert_eq!(store.list().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_store_instance_sees_the_first_ones_writes() {
+        // Simulates two separate `ephemera` CLI processes pointed at the
+        // same state_dir: each gets its own Store, loaded independently.
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = Store::load(dir.path()).unwrap();
+        let vm = fixture_record("from-a");
+        store_a.insert(vm.clone()).await.unwrap();
+
+        let store_b = Store::load(dir.path()).unwrap();
+        let seen = store_b.get(vm.id).await;
+        assert!(seen.is_some(), "a fresh Store instance must see another instance's writes");
+        assert_eq!(seen.unwrap().name, "from-a");
+    }
+
+    #[tokio::test]
+    async fn insert_with_cid_skips_used_cids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::load(dir.path()).unwrap();
+
+        let mut taken = fixture_record("taken-3");
+        taken.guest_cid = Some(3);
+        store.insert(taken).await.unwrap();
+
+        let assigned = store.insert_with_cid(fixture_record("wants-cid"), true, 3).await.unwrap();
+        assert_eq!(assigned.guest_cid, Some(4), "CID 3 is taken, so the next VM must get 4");
+    }
+
+    #[tokio::test]
+    async fn insert_with_cid_is_race_free_across_concurrent_processes() {
+        // Regression test for a real bug: allocating a CID via list() and
+        // inserting via a separate insert() call let two concurrent
+        // processes both compute the same "lowest free" CID before either
+        // persisted, so they'd collide (confirmed via a live 4-way
+        // concurrent `ephemera create` stress test before this was fixed).
+        // Each spawned task here gets its OWN Store — a fresh `load()`, not
+        // a shared handle — to accurately simulate separate OS processes
+        // racing on the same vms.json rather than just concurrent tasks
+        // sharing one in-process Store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let path = path.clone();
+            handles.push(tokio::spawn(async move {
+                let store = Store::load(&path).unwrap();
+                store
+                    .insert_with_cid(fixture_record(&format!("race-{i}")), true, 3)
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut cids = Vec::new();
+        for h in handles {
+            cids.push(h.await.unwrap().guest_cid.expect("CID must be assigned"));
+        }
+
+        let unique: HashSet<u32> = cids.iter().copied().collect();
+        assert_eq!(unique.len(), cids.len(), "all concurrently-assigned CIDs must be distinct: {cids:?}");
+
+        let store = Store::load(&path).unwrap();
+        assert_eq!(store.list().await.len(), 8, "no concurrent write should have been silently lost");
+    }
+}

@@ -94,3 +94,83 @@ async fn request_inner(socket: &Path, method: &str, path: &str, body: Option<&Va
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    /// Spawns a one-shot fake Firecracker: accepts a single connection,
+    /// reads (and discards) the request, then runs `respond` to write
+    /// whatever response bytes the test wants — in whatever order/timing it
+    /// wants — without ever closing the connection itself (Firecracker
+    /// doesn't; a client that waits for connection-close instead of
+    /// Content-Length hangs against it, which is exactly the bug this
+    /// module exists to avoid).
+    fn spawn_fake_firecracker<F, Fut>(respond: F) -> std::path::PathBuf
+    where
+        F: FnOnce(tokio::net::UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("firecracker.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Drain the request so the client's writes don't block on a full pipe.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            respond(stream).await;
+            // Keep dir (and the socket file) alive for the test's duration
+            // by leaking it here; the tempdir is cleaned up when the whole
+            // test process exits, which is fine for a test.
+            std::mem::forget(dir);
+        });
+        sock_path
+    }
+
+    #[tokio::test]
+    async fn succeeds_on_204_with_connection_kept_open() {
+        // This is the exact scenario that hung the original implementation:
+        // a real 204 response, connection left open afterward (Firecracker's
+        // actual behavior). A client waiting for EOF would block here until
+        // the caller's timeout fired despite the request having succeeded.
+        let sock = spawn_fake_firecracker(|mut stream| async move {
+            stream.write_all(b"HTTP/1.1 204 \r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await; // never closes on its own
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(&sock, "PATCH", "/vm", Some(&serde_json::json!({"state": "Paused"})), Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(result.is_ok(), "request() should return well before the connection ever closes");
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_arriving_in_a_later_read_is_still_assembled_correctly() {
+        let sock = spawn_fake_firecracker(|mut stream| async move {
+            stream.write_all(b"HTTP/1.1 400 \r\nContent-Length: 13\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await; // body shows up in a separate read
+            stream.write_all(b"bad-request!!").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let err = request(&sock, "PUT", "/actions", None, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.to_string().contains("bad-request!!"), "error should carry the exact body text: {err}");
+    }
+
+    #[tokio::test]
+    async fn errors_cleanly_if_peer_closes_before_headers_complete() {
+        let sock = spawn_fake_firecracker(|mut stream| async move {
+            stream.write_all(b"HTTP/1.1 20").await.unwrap(); // truncated mid-header
+            // stream drops here, closing the connection
+        });
+
+        let err = request(&sock, "GET", "/", None, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.to_string().contains("closed the connection"), "unexpected error: {err}");
+    }
+}

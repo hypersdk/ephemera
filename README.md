@@ -9,7 +9,7 @@ Firecracker, Cloud Hypervisor, and QEMU/KVM from one Rust-native control plane.
 
 It also contains a small **virt-builder-style image pipeline**: use a local/HTTP base image, verify SHA-256, convert/resize it, and customize it with `virt-customize`.
 
-> This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC and the Firecracker jailer (chroot + uid/gid isolation) are already implemented (see "Auth / RBAC" and "Firecracker jailer" below) — before exposing it to untrusted tenants, still add jailer cgroup limits, seccomp/AppArmor/SELinux policy, per-tenant network namespaces, quotas, audit logging and stronger image provenance.
+> This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC, the Firecracker jailer (chroot + uid/gid isolation), and cgroup v2 resource control are already implemented (see "Auth / RBAC", "Firecracker jailer", and "Resource control (cgroup v2)" below) — before exposing it to untrusted tenants, still add seccomp/AppArmor/SELinux policy, per-tenant network namespaces, quotas, audit logging and stronger image provenance.
 
 ## Architecture
 
@@ -367,6 +367,40 @@ Cloud Hypervisor VM's vsock connection *did* survive the identical pause/resume/
 the same client code, so this looks like a Firecracker vsock characteristic rather than an ephemera
 bug, but it's not something this project has a fix for.
 
+## Resource control (cgroup v2)
+
+Every VM (all three backends) is migrated into its own `ephemera.slice/{id}.scope` cgroup right after
+launch, giving real, kernel-enforced control independent of anything a VMM's own API exposes:
+
+```bash
+curl -sS -X POST http://127.0.0.1:7788/v1/vms/<uuid>/resources \
+  -H 'content-type: application/json' \
+  -d '{"cpu_quota_percent": 150, "memory_max_bytes": 536870912, "pids_max": 64}' | jq
+
+curl -sS -X POST http://127.0.0.1:7788/v1/vms/<uuid>/freeze   # cgroup-level freeze — works even if the VMM's own API doesn't respond
+curl -sS -X POST http://127.0.0.1:7788/v1/vms/<uuid>/thaw
+curl -sS http://127.0.0.1:7788/v1/vms/<uuid>/frozen            # {"frozen": true|false}
+curl -sS http://127.0.0.1:7788/v1/vms/<uuid>/stats              # CPU%, memory, disk I/O, read from the cgroup
+curl -sS http://127.0.0.1:7788/v1/vms/<uuid>/pressure           # PSI: cpu/memory/io some+full, avg10/60/300 + total
+```
+
+`resources` (`ResourcePatch`) is a partial patch — only the fields you set are touched: `cpu_quota_percent`
+(percentage of one core, e.g. `150` = 1.5 cores), `memory_max_bytes`, `io_weight` (1-10000), `pids_max`,
+`cpuset_cpus` (pin to specific host cores). `freeze`/`thaw` act on the cgroup directly via
+`cgroup.freeze`, independent of the VMM's own pause/resume API (see "Pause, resume, and exec" above) —
+useful as a control path that still works if a VMM's control socket is unresponsive. Delegation
+(`cgroup.subtree_control`) is set up once at `VmManager` startup; if that fails (e.g. no cgroup v2, or
+insufficient privilege), resource control/metrics are unavailable for that run but VM creation/lifecycle
+are otherwise unaffected — a warning is logged, not a hard failure.
+
+Verified on real hardware (`scripts/test-cgroup-resources.sh`, all through the REST API against a
+running `ephemera serve`): a launched VM really lands in its own cgroup (confirmed by reading
+`cgroup.procs` directly, not just trusting the recorded path); a memory limit set via `resources` is
+really written to `memory.max` and reads back correctly; `freeze` really stops the VMM process (CPU
+time frozen with a forced busy-loop running in the guest, same technique used to verify QMP-level
+pause) and `thaw` really resumes it; `stats`/`pressure` return real nonzero, cgroup-derived numbers;
+`delete` removes the VM's cgroup directory.
+
 ## Warm VM pools
 
 A pool keeps `size` VMs booted from a template sitting `Paused`, ready to be handed out on `claim` in
@@ -494,6 +528,12 @@ POST   /v1/vms/{uuid}/start
 POST   /v1/vms/{uuid}/stop
 POST   /v1/vms/{uuid}/pause
 POST   /v1/vms/{uuid}/resume
+POST   /v1/vms/{uuid}/resources
+POST   /v1/vms/{uuid}/freeze
+POST   /v1/vms/{uuid}/thaw
+GET    /v1/vms/{uuid}/frozen
+GET    /v1/vms/{uuid}/stats
+GET    /v1/vms/{uuid}/pressure
 POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
@@ -519,8 +559,9 @@ needs running again.
 route except `GET /healthz`. Absent or empty `auth.tokens` (the default) leaves the API exactly as
 open as the pre-auth MVP — every request is treated as `admin`. Two roles:
 
-- `admin` — everything: create/stop/pause/resume/exec/delete/build-image.
-- `read-only` — `GET /v1/vms`, `GET /v1/vms/{uuid}`, `GET /metrics` only; any mutating route returns 403.
+- `admin` — everything: create/stop/pause/resume/exec/delete/build-image/resources/freeze/thaw.
+- `read-only` — any `GET` route (`/v1/vms`, `/v1/vms/{uuid}`, `/metrics`, `/frozen`, `/stats`,
+  `/pressure`, pool list/get) only; any mutating route (including `resources`/`freeze`/`thaw`) returns 403.
 
 ```bash
 curl -sS http://127.0.0.1:7788/v1/vms -H 'Authorization: Bearer <token>'
@@ -662,7 +703,7 @@ assigned the same vsock CID.
 
 ## Production changes I would make next
 
-1. **Firecracker jailer resource limits** — `jailer`'s cgroup/resource-limit flags (`--cgroup`, `--resource-limit`) aren't wired up yet; chroot + uid/gid isolation are already implemented — see "Firecracker jailer" above.
+1. **Firecracker jailer's own `--cgroup`/`--resource-limit` flags** — not wired up, but superseded in practice: every VM (all three backends, not just jailed Firecracker) already gets real cgroup v2 resource control (CPU/memory/IO/pids/cpuset, freeze/thaw, stats, PSI pressure) independent of the jailer — see "Resource control (cgroup v2)" above.
 2. **Network namespaces** — one namespace per VM, veth/TAP, nftables, DHCP/IPAM.
 3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.

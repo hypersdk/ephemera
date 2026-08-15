@@ -80,6 +80,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/vms", post(create_vm).get(list_vms))
         .route("/v1/vms/{id}", get(get_vm).delete(delete_vm))
+        .route("/v1/vms/{id}/start", post(start_vm))
         .route("/v1/vms/{id}/stop", post(stop_vm))
         .route("/v1/vms/{id}/pause", post(pause_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
@@ -168,6 +169,10 @@ async fn list_vms(State(m): State<Arc<VmManager>>, Query(q): Query<ListVmsQuery>
 }
 async fn get_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!(m.get(id).await?)))
+}
+async fn start_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    Ok(Json(json!(m.start(id).await?)))
 }
 async fn stop_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     require_admin(role)?;

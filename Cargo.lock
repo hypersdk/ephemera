@@ -1045,6 +1045,7 @@ dependencies = [
  "async-trait",
  "ephemera-core",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

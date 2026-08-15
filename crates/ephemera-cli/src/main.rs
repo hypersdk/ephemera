@@ -30,6 +30,9 @@ enum Command {
     Create { #[arg(long)] spec: PathBuf },
     List,
     Get { id: Uuid },
+    /// Relaunch a Stopped VM from its existing disk (skips image
+    /// clone/cloud-init reseed — see VmManager::start).
+    Start { id: Uuid },
     Stop { id: Uuid },
     Pause { id: Uuid },
     Resume { id: Uuid },
@@ -91,6 +94,7 @@ async fn main() -> Result<()> {
         }
         Command::List => println!("{}", serde_json::to_string_pretty(&m.list().await)?),
         Command::Get { id } => println!("{}", serde_json::to_string_pretty(&m.get(id).await?)?),
+        Command::Start { id } => println!("{}", serde_json::to_string_pretty(&m.start(id).await?)?),
         Command::Stop { id } => println!("{}", serde_json::to_string_pretty(&m.stop(id).await?)?),
         Command::Pause { id } => println!("{}", serde_json::to_string_pretty(&m.pause(id).await?)?),
         Command::Resume { id } => println!("{}", serde_json::to_string_pretty(&m.resume(id).await?)?),
@@ -105,8 +109,16 @@ async fn main() -> Result<()> {
         }
         Command::Pool { command } => match command {
             PoolCommand::Create { spec } => {
-                let spec = serde_json::from_slice(&std::fs::read(spec)?)?;
-                println!("{}", serde_json::to_string_pretty(&m.create_pool(spec).await?)?);
+                let spec: ephemera_core::model::PoolSpec = serde_json::from_slice(&std::fs::read(spec)?)?;
+                let name = spec.name.clone();
+                m.create_pool(spec).await?;
+                // This CLI process exits right after printing — wait for a
+                // real backfill here rather than relying on the background
+                // task create_pool() also fires off, which would otherwise
+                // get killed mid-flight along with this process (see
+                // VmManager::backfill_pool_sync's doc comment).
+                m.backfill_pool_sync(&name).await?;
+                println!("{}", serde_json::to_string_pretty(&m.get_pool(&name).await?)?);
             }
             PoolCommand::List => println!("{}", serde_json::to_string_pretty(&m.list_pools().await)?),
             PoolCommand::Get { name } => println!("{}", serde_json::to_string_pretty(&m.get_pool(&name).await?)?),

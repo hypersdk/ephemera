@@ -219,6 +219,65 @@ impl VmManager {
         self.store.get(id).await.context("VM not found")
     }
 
+    /// Relaunch a `Stopped` VM from its existing disk/seed — unlike
+    /// `create`, this skips image cloning, guest-agent token injection, and
+    /// cloud-init seed generation, since all of that already happened the
+    /// first time this record was created and is still sitting on disk.
+    /// Only network device prep is redone (the tap/macvtap was torn down on
+    /// stop). Added for consumers keyed by a name/register-then-start model
+    /// (zyvor-fabric's `driver-core::VMDriver::start`) that need to resume a
+    /// VM without repeating create-time work.
+    pub async fn start(self: &Arc<Self>, id: Uuid) -> Result<VmRecord> {
+        let mut vm = self.get(id).await?;
+        if vm.status == VmStatus::Running {
+            return Ok(vm);
+        }
+        if !vm.disk.exists() {
+            bail!("cannot start {id}: disk no longer exists at {}", vm.disk.display());
+        }
+
+        let result: Result<()> = async {
+            let network = ephemera_network::prepare(&self.cfg, id, &vm.request.network).await?;
+            vm.tap_name = network.tap_name.clone();
+
+            let vsock_socket = match (vm.guest_cid, vm.backend) {
+                (Some(_), BackendKind::Qemu) => None,
+                (Some(_), _) => Some(vm.workspace.join("vsock.sock")),
+                (None, _) => None,
+            };
+
+            let ctx = LaunchContext {
+                id,
+                workspace: vm.workspace.clone(),
+                disk: vm.disk.clone(),
+                seed_disk: vm.seed_disk.clone(),
+                log_path: vm.log_path.clone(),
+                network,
+                guest_cid: vm.guest_cid,
+                vsock_socket,
+            };
+            let launch = backend(vm.backend)?.launch(&self.cfg, &vm.request, &ctx).await?;
+            vm.pid = Some(launch.pid);
+            vm.control_socket = launch.control_socket;
+            vm.status = VmStatus::Running;
+            vm.error = None;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            if let Some(tap) = &vm.tap_name {
+                let _ = ephemera_network::cleanup(&vm.request.network, tap).await;
+            }
+            vm.status = VmStatus::Failed;
+            vm.error = Some(format!("{e:#}"));
+            self.store.update(vm.clone()).await?;
+            return Err(e);
+        }
+        self.store.update(vm.clone()).await?;
+        Ok(vm)
+    }
+
     pub async fn stop(&self, id: Uuid) -> Result<VmRecord> {
         let mut vm = self.get(id).await?;
         if let Some(pid) = vm.pid {
@@ -289,6 +348,17 @@ impl VmManager {
         Ok(())
     }
 
+    /// Runs `reconcile()`, TTL cleanup, and pool backfill on every tick.
+    /// Pool backfill in particular *needs* this: `create_pool`/
+    /// `claim_from_pool` also fire off a best-effort background top-up via
+    /// `tokio::spawn`, but that only actually finishes if the calling
+    /// process stays alive long enough — true for a request handled inside
+    /// this `serve` process, but NOT true for a one-shot `ephemera pool
+    /// create`/`claim` CLI invocation, which exits (killing every task it
+    /// spawned, finished or not) right after printing its result. This tick
+    /// is the backstop that keeps every pool topped up regardless of which
+    /// process's claim/create under-filled it — the same reason TTL cleanup
+    /// lives here rather than in `delete`'s caller.
     pub fn start_reaper(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move {
@@ -300,6 +370,11 @@ impl VmManager {
                 for vm in me.store.list().await {
                     if vm.expires_at.is_some_and(|t| t <= now) {
                         if let Err(e) = me.delete(vm.id).await { tracing::warn!(vm=%vm.id, error=?e, "TTL cleanup failed"); }
+                    }
+                }
+                for pool in me.pools.list().await {
+                    if pool.members.len() < pool.size {
+                        me.spawn_backfill(pool.name);
                     }
                 }
             }
@@ -380,6 +455,19 @@ impl VmManager {
         Ok(vm)
     }
 
+    /// Blocking variant of the backfill that `create_pool`/`claim_from_pool`
+    /// otherwise only fire off in the background: waits for `name`'s pool
+    /// to actually reach its target size before returning. Meant for
+    /// one-shot callers — the CLI's `ephemera pool create` uses this so the
+    /// pool is genuinely ready by the time that (short-lived) process
+    /// exits, without depending on a separately-running `ephemera serve`
+    /// daemon's reaper tick to finish the job later. A REST caller inside
+    /// `serve` has no need for this — the process outlives the background
+    /// task either way.
+    pub async fn backfill_pool_sync(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.backfill_pool(name).await
+    }
+
     fn spawn_backfill(self: &Arc<Self>, pool_name: String) {
         let me = self.clone();
         tokio::spawn(async move {
@@ -411,7 +499,19 @@ impl VmManager {
             req.name = format!("{name}-pool-{}", Uuid::new_v4());
             req.ttl_seconds = None; // a paused pool member must never expire on its own
             let vm = self.create(req).await.context("creating pool member")?;
-            let paused = self.pause(vm.id).await.context("pausing new pool member")?;
+            let paused = match self.pause(vm.id).await {
+                Ok(paused) => paused,
+                Err(e) => {
+                    // The VM was created successfully but never made it into
+                    // any pool's members — clean it up rather than abandon
+                    // an untracked, unpaused VM outside all pool accounting
+                    // (e.g. `launch` can report success even though the
+                    // spawned VMM process crashes moments later for its own
+                    // reasons, which then makes `pause`'s QMP connect fail).
+                    let _ = self.delete(vm.id).await;
+                    return Err(e).context("pausing new pool member");
+                }
+            };
             if !self.pools.push_member(name, paused.id).await? {
                 // Pool was deleted while this member was being created.
                 let _ = self.delete(paused.id).await;

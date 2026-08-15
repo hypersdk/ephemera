@@ -6,14 +6,21 @@
 # claim_from_pool / delete_pool). Boots real QEMU VMs.
 #
 # Proves:
-# - a pool backfills to its target size on its own (create + pause per
-#   member, done asynchronously by a background task — see
-#   VmManager::backfill_pool)
+# - `ephemera pool create` (a one-shot CLI process) leaves the pool actually
+#   full by the time it exits, not just "eventually, if something else
+#   happens to finish the job" (see VmManager::backfill_pool_sync)
 # - claiming pops a ready member and resumes it MUCH faster than a full
 #   create would take (timed against a plain create for comparison)
-# - the pool backfills again after a claim, without the caller asking for it
+# - a *separately running* `ephemera serve` daemon backfills the pool again
+#   after a claim on its own reaper tick — proving pool health doesn't
+#   depend on whichever short-lived CLI process triggered the claim (see
+#   VmManager::start_reaper's pool-backfill pass)
 # - two claims in a row hand out two different VMs
 # - deleting a pool cleans up every member VM it still owns
+#
+# Starts `ephemera serve` in the background for the backfill-after-claim
+# check, since that's the realistic deployment shape for pools (a `serve`
+# daemon's reaper keeps them topped up) — and stops it again on exit.
 #
 # Usage:
 #   sudo ./scripts/test-warm-pool.sh --image /var/lib/ephemera/images/ephemera-lifecycle-test.qcow2
@@ -66,7 +73,9 @@ section() { echo ""; echo "=== $1 ==="; }
 
 TMP="$(mktemp -d)"
 POOL="ephemera-pool-test"
+SERVE_PID=""
 cleanup() {
+    [ -n "$SERVE_PID" ] && kill "$SERVE_PID" >/dev/null 2>&1 || true
     eph pool delete "$POOL" >/dev/null 2>&1 || true
     rm -rf "$TMP"
 }
@@ -149,9 +158,20 @@ else
     fail "exec failed on the claimed VM"
 fi
 
-section "Pool backfills again after the claim, without being asked"
-if wait_for_pool_size 2; then
-    pass "pool refilled back to 2 members after the claim"
+section "Start a real 'ephemera serve' daemon (owns pool backfill going forward)"
+"$EPH" "${CFG_ARGS[@]}" serve > "${TMP}/serve.log" 2>&1 &
+SERVE_PID=$!
+sleep 2
+if kill -0 "$SERVE_PID" 2>/dev/null; then
+    pass "ephemera serve started (pid ${SERVE_PID})"
+else
+    fail "ephemera serve failed to start — see ${TMP}/serve.log"
+    cat "${TMP}/serve.log" >&2 || true
+fi
+
+section "The running daemon backfills the pool again after the claim, unasked"
+if wait_for_pool_size 2 60; then
+    pass "pool refilled back to 2 members via the daemon's reaper tick"
 else
     fail "pool did not refill after the claim"
 fi
@@ -164,8 +184,13 @@ CLAIMED2_ID=$(echo "$CLAIMED2" | json_field id)
 eph delete "$CLAIMED_ID" >/dev/null 2>&1 || true
 eph delete "$CLAIMED2_ID" >/dev/null 2>&1 || true
 
+section "Stop the daemon before deleting the pool (avoid racing its reaper)"
+kill "$SERVE_PID" >/dev/null 2>&1 || true
+wait "$SERVE_PID" 2>/dev/null || true
+SERVE_PID=""
+pass "ephemera serve stopped"
+
 section "Delete pool cleans up remaining members"
-wait_for_pool_size 2 >/dev/null 2>&1 || true
 REMAINING=$(eph pool get "$POOL" | python3 -c "import json,sys;print(json.load(sys.stdin)['members'])" | python3 -c "import ast,sys;print(len(ast.literal_eval(sys.stdin.read())))" 2>/dev/null || echo 0)
 eph pool delete "$POOL"
 LIST_AFTER=$(eph list)

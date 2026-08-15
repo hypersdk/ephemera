@@ -1,0 +1,8 @@
+[package]
+name = "ephemera-kube"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Reserved for the Kubernetes DisposableVM CRD/operator integration"
+
+[dependencies]

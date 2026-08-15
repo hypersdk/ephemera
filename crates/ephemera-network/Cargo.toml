@@ -1,0 +1,11 @@
+[package]
+name = "ephemera-network"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "TAP/bridge network preparation for Zyvor Ephemera"
+
+[dependencies]
+ephemera-core = { path = "../ephemera-core" }
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }

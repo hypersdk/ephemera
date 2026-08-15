@@ -1,0 +1,20 @@
+[package]
+name = "ephemera-scheduler"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "VM lifecycle orchestration (VmManager) for Zyvor Ephemera"
+
+[dependencies]
+ephemera-core = { path = "../ephemera-core" }
+ephemera-storage = { path = "../ephemera-storage" }
+ephemera-network = { path = "../ephemera-network" }
+ephemera-image = { path = "../ephemera-image" }
+ephemera-qemu = { path = "../ephemera-qemu" }
+ephemera-cloud-hypervisor = { path = "../ephemera-cloud-hypervisor" }
+ephemera-firecracker = { path = "../ephemera-firecracker" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -1,0 +1,13 @@
+listen = "127.0.0.1:7788"
+state_dir = "/var/lib/ephemera"
+run_dir = "/run/ephemera"
+qemu_binary = "qemu-system-x86_64"
+qemu_img_binary = "qemu-img"
+cloud_hypervisor_binary = "cloud-hypervisor"
+cloud_localds_binary = "cloud-localds"
+virt_customize_binary = "virt-customize"
+firecracker_binary = "firecracker"
+# firecracker_kernel = "/var/lib/ephemera/kernels/vmlinux"
+# cloud_hypervisor_firmware = "/usr/share/cloud-hypervisor/CLOUDHV.fd"
+default_bridge = "vmbr0"
+reaper_interval_secs = 5

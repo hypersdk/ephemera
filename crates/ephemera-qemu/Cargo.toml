@@ -1,0 +1,11 @@
+[package]
+name = "ephemera-qemu"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "QEMU/KVM VmBackend implementation for Zyvor Ephemera"
+
+[dependencies]
+ephemera-core = { path = "../ephemera-core" }
+anyhow = "1"
+async-trait = "0.1"

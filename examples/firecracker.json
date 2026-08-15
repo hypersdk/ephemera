@@ -1,0 +1,10 @@
+{
+  "name": "fc-ephemeral",
+  "backend": "firecracker",
+  "image": "/var/lib/ephemera/images/ubuntu.ext4",
+  "kernel": "/var/lib/ephemera/kernels/vmlinux",
+  "vcpus": 2,
+  "memory_mib": 1024,
+  "network": {"mode": "tap", "bridge": "vmbr0", "mac": "06:00:AC:10:00:02"},
+  "ttl_seconds": 300
+}

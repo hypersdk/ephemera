@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ephemera-core",
+    "crates/ephemera-storage",
+    "crates/ephemera-network",
+    "crates/ephemera-image",
+    "crates/ephemera-qemu",
+    "crates/ephemera-cloud-hypervisor",
+    "crates/ephemera-firecracker",
+    "crates/ephemera-scheduler",
+    "crates/ephemera-api",
+    "crates/ephemera-cli",
+    "crates/ephemera-agent",
+    "crates/ephemera-kube",
+]

@@ -1,0 +1,16 @@
+[package]
+name = "ephemera-api"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "REST API for Zyvor Ephemera"
+
+[dependencies]
+ephemera-core = { path = "../ephemera-core" }
+ephemera-scheduler = { path = "../ephemera-scheduler" }
+ephemera-image = { path = "../ephemera-image" }
+anyhow = "1"
+axum = "0.8"
+serde_json = "1"
+tower-http = { version = "0.6", features = ["trace"] }
+uuid = { version = "1", features = ["v4", "serde"] }

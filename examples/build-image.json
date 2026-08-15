@@ -1,0 +1,9 @@
+{
+  "source": "/var/lib/ephemera/images/base-ubuntu.qcow2",
+  "output": "/var/lib/ephemera/images/ubuntu-dev.qcow2",
+  "format": "qcow2",
+  "size_gib": 20,
+  "hostname": "zyvor-template",
+  "packages": ["curl", "jq", "qemu-guest-agent"],
+  "commands": ["systemctl enable qemu-guest-agent"]
+}

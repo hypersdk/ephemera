@@ -1,0 +1,15 @@
+{
+  "name": "ch-ephemeral",
+  "backend": "cloud-hypervisor",
+  "image": "/var/lib/ephemera/images/ubuntu.qcow2",
+  "vcpus": 2,
+  "memory_mib": 2048,
+  "kernel": "/usr/share/cloud-hypervisor/hypervisor-fw",
+  "network": {"mode": "tap", "bridge": "vmbr0"},
+  "cloud_init": {
+    "hostname": "ch-ephemeral",
+    "user": "zyvor",
+    "ssh_authorized_keys": ["ssh-ed25519 REPLACE_ME"]
+  },
+  "ttl_seconds": 900
+}

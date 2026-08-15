@@ -13,7 +13,7 @@
 
 use anyhow::{bail, Context, Result};
 use ephemera_core::model::{BackendKind, VmRecord};
-use ephemera_guest_protocol::{decode_line, encode_line, AgentRequest, AgentResponse};
+use ephemera_guest_protocol::{decode_line, encode_line, AgentRequest, AgentResponse, Envelope};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -22,22 +22,20 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Dials `vm`'s guest agent and returns its response to `request`, bounded
 /// by `timeout` (the whole round trip: connect + handshake + exchange).
+/// `vm.request.agent.token` (if set — see `AgentSpec::token`) rides along in
+/// every request automatically; callers never need to supply it themselves.
 pub async fn call(vm: &VmRecord, request: AgentRequest, timeout: Duration) -> Result<AgentResponse> {
-    let port = vm
-        .request
-        .agent
-        .as_ref()
-        .filter(|a| a.enabled)
-        .map(|a| a.port)
-        .context("guest agent is not enabled for this VM")?;
+    let agent = vm.request.agent.as_ref().filter(|a| a.enabled).context("guest agent is not enabled for this VM")?;
+    let port = agent.port;
+    let envelope = Envelope::new(agent.token.clone(), request);
     let cid = vm.guest_cid.context("VM has no vsock CID assigned")?;
 
     tokio::time::timeout(timeout, async {
         match vm.backend {
-            BackendKind::Qemu => native_vsock_call(cid, port, &request).await,
+            BackendKind::Qemu => native_vsock_call(cid, port, &envelope).await,
             BackendKind::CloudHypervisor | BackendKind::Firecracker => {
                 let socket = vm.workspace.join("vsock.sock");
-                uds_proxy_call(&socket, port, &request).await
+                uds_proxy_call(&socket, port, &envelope).await
             }
             BackendKind::Auto => bail!("VM has an unresolved BackendKind::Auto — this is a bug, backend selection must happen before a VM is persisted"),
         }
@@ -46,7 +44,7 @@ pub async fn call(vm: &VmRecord, request: AgentRequest, timeout: Duration) -> Re
     .context("guest agent call timed out")?
 }
 
-async fn uds_proxy_call(socket: &std::path::Path, guest_port: u32, request: &AgentRequest) -> Result<AgentResponse> {
+async fn uds_proxy_call(socket: &std::path::Path, guest_port: u32, envelope: &Envelope) -> Result<AgentResponse> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connecting to vsock proxy socket {}", socket.display()))?;
@@ -66,7 +64,7 @@ async fn uds_proxy_call(socket: &std::path::Path, guest_port: u32, request: &Age
     }
 
     write_half
-        .write_all(encode_line(request)?.as_bytes())
+        .write_all(encode_line(envelope)?.as_bytes())
         .await
         .context("writing agent request")?;
 
@@ -82,15 +80,15 @@ async fn uds_proxy_call(socket: &std::path::Path, guest_port: u32, request: &Age
 }
 
 #[cfg(target_os = "linux")]
-async fn native_vsock_call(cid: u32, port: u32, request: &AgentRequest) -> Result<AgentResponse> {
-    let request = request.clone();
-    tokio::task::spawn_blocking(move || native_vsock_call_blocking(cid, port, &request))
+async fn native_vsock_call(cid: u32, port: u32, envelope: &Envelope) -> Result<AgentResponse> {
+    let envelope = envelope.clone();
+    tokio::task::spawn_blocking(move || native_vsock_call_blocking(cid, port, &envelope))
         .await
         .context("vsock worker thread panicked")?
 }
 
 #[cfg(target_os = "linux")]
-fn native_vsock_call_blocking(cid: u32, port: u32, request: &AgentRequest) -> Result<AgentResponse> {
+fn native_vsock_call_blocking(cid: u32, port: u32, envelope: &Envelope) -> Result<AgentResponse> {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
 
@@ -136,7 +134,7 @@ fn native_vsock_call_blocking(cid: u32, port: u32, request: &AgentRequest) -> Re
             std::mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
 
-        file.write_all(encode_line(request)?.as_bytes())
+        file.write_all(encode_line(envelope)?.as_bytes())
             .context("writing agent request over vsock")?;
 
         let mut buf = Vec::new();
@@ -156,7 +154,7 @@ fn native_vsock_call_blocking(cid: u32, port: u32, request: &AgentRequest) -> Re
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn native_vsock_call(_cid: u32, _port: u32, _request: &AgentRequest) -> Result<AgentResponse> {
+async fn native_vsock_call(_cid: u32, _port: u32, _envelope: &Envelope) -> Result<AgentResponse> {
     bail!("native AF_VSOCK is only supported on Linux")
 }
 

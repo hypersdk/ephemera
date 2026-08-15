@@ -126,11 +126,16 @@ create_and_check() {
     # falling through to emergency mode — where the guest agent (no local-fs
     # dependency) is already up. Firecracker boots need a longer budget than
     # QEMU's for exactly this reason, not because anything is actually stuck.
-    # Observed 93-140s from create-return to agent-reachable on the real
-    # test host (raw-disk clone isn't reflink-able on this filesystem, so
-    # the ~2.6G copy plus the ~90s local-fs.target timeout above both land
-    # in this window) — 60 attempts gives real headroom over that.
-    [ "$backend" = "firecracker" ] && attempts=60
+    # Observed 93-140s from create-return to agent-reachable in isolation on
+    # the real test host (raw-disk clone isn't reflink-able on this
+    # filesystem, so the ~2.6G copy plus the ~90s local-fs.target timeout
+    # above both land in this window), but back-to-back Cases B and C in the
+    # same run add real contention on top of that (concurrent disk I/O,
+    # guestkit's qemu-nbd mount for the guest-agent token injection — see
+    # ephemera_image::inject_guest_agent_token — competing with whatever the
+    # previous case is still cleaning up) and pushed this past 240s in
+    # practice. 90 attempts gives real headroom over the worst case seen.
+    [ "$backend" = "firecracker" ] && attempts=90
     if wait_exec "$id" "$attempts"; then
         pass "$label: vsock exec reachable on the resolved backend"
     else

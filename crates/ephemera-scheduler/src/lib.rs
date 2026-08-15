@@ -118,6 +118,16 @@ impl VmManager {
         let log_path = workspace.join("console.log");
         let expires_at = req.ttl_seconds.map(|s| Utc::now() + Duration::seconds(s as i64));
         let needs_cid = req.agent.as_ref().is_some_and(|a| a.enabled);
+        // Every agent-enabled VM gets a token whether the caller supplied
+        // one or not — generated here (before `placeholder` is built) so
+        // the persisted record always reflects the token actually burned
+        // into the guest's disk below, never a stale/absent one.
+        if needs_cid {
+            let agent = req.agent.as_mut().expect("needs_cid implies req.agent is Some");
+            if agent.token.is_none() {
+                agent.token = Some(Uuid::new_v4().to_string());
+            }
+        }
 
         let placeholder = VmRecord {
             id,
@@ -146,6 +156,10 @@ impl VmManager {
 
         let result: Result<()> = async {
             ephemera_image::clone_for_vm(&self.cfg, &req.image, req.backend, &disk, req.disk_size_gib).await?;
+            if let Some(token) = req.agent.as_ref().and_then(|a| a.token.as_deref()) {
+                ephemera_image::inject_guest_agent_token(&disk, token).await
+                    .context("injecting guest-agent auth token into instance disk")?;
+            }
             let seed = match &req.cloud_init {
                 Some(ci) => Some(ephemera_image::cloudinit::build_seed(&self.cfg, &workspace, ci).await?),
                 None => None,

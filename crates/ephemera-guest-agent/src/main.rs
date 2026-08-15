@@ -11,11 +11,16 @@ use ephemera_guest_protocol::DEFAULT_PORT;
 #[cfg(target_os = "linux")]
 use anyhow::Context;
 #[cfg(target_os = "linux")]
-use ephemera_guest_protocol::{decode_line, encode_line, AgentRequest, AgentResponse, DEFAULT_EXEC_TIMEOUT_SECS};
+use ephemera_guest_protocol::{
+    constant_time_eq, decode_line, encode_line, AgentRequest, AgentResponse, Envelope,
+    DEFAULT_EXEC_TIMEOUT_SECS, TOKEN_FILE_PATH,
+};
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
@@ -35,6 +40,18 @@ fn main() -> Result<()> {
 #[cfg(target_os = "linux")]
 fn run_server(port: u32) -> Result<()> {
     use std::os::fd::FromRawFd;
+
+    let expected_token: Arc<Option<String>> = Arc::new(
+        std::fs::read_to_string(TOKEN_FILE_PATH)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    );
+    if expected_token.is_some() {
+        eprintln!("ephemera-guest-agent: token found at {TOKEN_FILE_PATH}, requests must authenticate");
+    } else {
+        eprintln!("ephemera-guest-agent: WARNING no token at {TOKEN_FILE_PATH} — running unauthenticated, any vsock caller can run commands as root");
+    }
 
     let listener_fd = unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
@@ -69,9 +86,10 @@ fn run_server(port: u32) -> Result<()> {
             eprintln!("accept failed: {}", std::io::Error::last_os_error());
             continue;
         }
+        let expected_token = expected_token.clone();
         std::thread::spawn(move || {
             let file = unsafe { std::fs::File::from_raw_fd(conn_fd) };
-            if let Err(e) = handle_connection(file) {
+            if let Err(e) = handle_connection(file, &expected_token) {
                 eprintln!("connection error: {e:#}");
             }
         });
@@ -84,7 +102,7 @@ fn run_server(_port: u32) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn handle_connection(file: std::fs::File) -> Result<()> {
+fn handle_connection(file: std::fs::File, expected_token: &Option<String>) -> Result<()> {
     let mut writer = file.try_clone().context("cloning connection fd")?;
     let mut reader = BufReader::new(file);
 
@@ -92,9 +110,18 @@ fn handle_connection(file: std::fs::File) -> Result<()> {
     if reader.read_line(&mut line).context("reading request")? == 0 {
         return Ok(()); // peer closed without sending anything
     }
-    let request: AgentRequest = decode_line(&line).context("parsing request")?;
+    let envelope: Envelope = decode_line(&line).context("parsing request")?;
 
-    let response = match request {
+    if let Some(expected) = expected_token {
+        let authorized = envelope.token.as_deref().is_some_and(|got| constant_time_eq(expected, got));
+        if !authorized {
+            writer.write_all(encode_line(&AgentResponse::Error { message: "unauthorized: missing or incorrect token".into() })?.as_bytes())?;
+            writer.flush()?;
+            return Ok(());
+        }
+    }
+
+    let response = match envelope.request {
         AgentRequest::Ping => AgentResponse::Pong,
         AgentRequest::Exec { command, timeout_seconds } => {
             exec_with_timeout(&command, Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)))

@@ -70,11 +70,19 @@ pub struct AgentSpec {
     pub enabled: bool,
     #[serde(default = "default_agent_port")]
     pub port: u32,
+    /// Shared secret the guest agent requires on every request. If left
+    /// unset on a request with `enabled: true`, `VmManager::create`
+    /// generates a random one and burns it into that VM's own disk before
+    /// boot (see `ephemera_image::inject_guest_agent_token`) — every
+    /// agent-enabled VM ends up authenticated by default, without the
+    /// caller having to think about it.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 fn default_agent_port() -> u32 { 17777 }
 
 impl Default for AgentSpec {
-    fn default() -> Self { Self { enabled: false, port: default_agent_port() } }
+    fn default() -> Self { Self { enabled: false, port: default_agent_port(), token: None } }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

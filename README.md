@@ -312,6 +312,18 @@ image to have `ephemera-guest-agent` installed and running — build it with `ca
 -p ephemera-guest-agent` and bake it into an image via `build-image`'s `copy_in`/`enable_services`
 (see "Build an image" below, and `systemd/ephemera-guest-agent.service`).
 
+**Guest-agent auth:** every agent-enabled VM gets a random shared-secret token (or the one you set in
+`agent.token`) burned into that VM's own disk — never the shared base image — before it boots, at
+`/etc/ephemera-guest-agent.token`. The agent checks it on every request; `eph exec`/the REST `/agent`
+route supply it automatically from the VM's own record, so callers never handle it directly. This
+stops a process on the host *other than ephemera* from opening a raw vsock socket to the VM's CID and
+running commands as root — it does not replace REST-layer auth (see below), which answers a different
+question ("can this caller reach ephemera's API at all"). A VM created before this existed, or with no
+token file baked into its image for another reason, still runs the agent unauthenticated — check the
+agent's own startup log line to be sure. Verified on real hardware
+(`scripts/test-guest-agent-auth.sh`): a raw, tokenless (or wrong-token) vsock request is rejected,
+the correct token succeeds, and `eph exec` keeps working unmodified.
+
 `stop` always tries a graceful VMM-level shutdown first (QMP `system_powerdown` for QEMU, `ch-remote
 shutdown` for Cloud Hypervisor, `SendCtrlAltDel` for Firecracker — x86_64 only, no ARM equivalent in
 Firecracker's API today) and only force-kills the process if it doesn't exit within a grace period.
@@ -399,6 +411,25 @@ POST   /v1/images/build
 `GET /metrics` returns Prometheus text-exposition-format gauges: `ephemera_vms_total{status="..."}`,
 `ephemera_vms_by_backend{backend="..."}`, and `ephemera_vms_agent_enabled` — point a Prometheus
 `scrape_config` at it directly, no exporter needed.
+
+### Auth / RBAC
+
+`[[auth.tokens]]` entries in the config (see `config.example.toml`) enable bearer-token auth on every
+route except `GET /healthz`. Absent or empty `auth.tokens` (the default) leaves the API exactly as
+open as the pre-auth MVP — every request is treated as `admin`. Two roles:
+
+- `admin` — everything: create/stop/pause/resume/exec/delete/build-image.
+- `read-only` — `GET /v1/vms`, `GET /v1/vms/{uuid}`, `GET /metrics` only; any mutating route returns 403.
+
+```bash
+curl -sS http://127.0.0.1:7788/v1/vms -H 'Authorization: Bearer <token>'
+```
+
+No token, or a token not in the config, gets 401. A `read-only` token on a mutating route gets 403.
+Token comparison is constant-time. Verified on real hardware: 401 with no/wrong token, 200 for
+`read-only` on `GET /v1/vms`, 403 for `read-only` on `POST /v1/vms`, 400 for `admin` on the same route
+with an invalid body (proving auth let it through to the actual handler), 200 on `/healthz` with no
+token at all even with auth enabled.
 
 Create through REST:
 
@@ -536,7 +567,7 @@ assigned the same vsock CID.
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
 5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
 6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).
-7. **Auth** — mTLS/OIDC, RBAC, tenant IDs and audit events, and an authenticated guest-agent protocol (today's vsock agent trusts any caller that can reach the VM's CID).
+7. **Auth** — mTLS/OIDC, tenant IDs and audit events. Bearer-token REST auth/RBAC (admin/read-only) and a per-VM authenticated guest-agent protocol are already implemented; see "Auth / RBAC" and "Pause, resume, and exec" above.
 8. **Observability** — tracing, per-VM boot timing and failure reasons (a basic Prometheus `/metrics` endpoint — VM counts by status/backend, agent-enabled count — is already implemented; see the REST API section).
 9. **Kubernetes CRD/operator** — `DisposableVM` CRD backed by node-local daemonsets (`ephemera-kube`).
 10. **Distributed node-agent** — `ephemera-agent` (the per-*host* one, not `ephemera-guest-agent`) running per hypervisor host, reporting to a central `ephemera-scheduler`.
@@ -554,8 +585,8 @@ assigned the same vsock CID.
 - Firecracker image preparation is stricter than QEMU because it boots a kernel/rootfs directly.
 - Guest disk partition/filesystem expansion after `qemu-img resize` is an image/guest concern. Use cloud-init growpart or your image pipeline.
 - `extra_args` is intentionally an administrator escape hatch. Do not expose it to untrusted tenants.
-- The API is localhost-only by default and has no authentication in this MVP.
-- The vsock guest agent has no authentication either — anything that can reach a VM's CID/port can run commands as root in the guest. Fine for a trusted single-tenant host; not fine to expose across a tenant boundary.
+- The API is localhost-only by default. Bearer-token auth/RBAC is opt-in (see "Auth / RBAC") — an operator who doesn't configure `[[auth.tokens]]` still gets the old open-by-default behavior.
+- The vsock guest agent is authenticated by default for any VM created with `agent.enabled: true` (see "Pause, resume, and exec"), but this doesn't extend to mTLS/OIDC-style identity — it's one shared secret per VM, good enough to stop an unrelated host process, not a multi-tenant authorization model.
 - `guestkit`'s `inspect_os()` (used by `copy_in`) only recognizes partitioned disks and LVM volumes as OS roots by default; support for a bare, unpartitioned whole-disk filesystem (the shape Firecracker rootfs images are typically built in) was added as part of this project's testing and needs to make it into a real guestkit release — until then, building against a `guestkit` checkout without that fix will fail `copy_in` on such images with "no operating system found in image".
 
 ## License

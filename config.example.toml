@@ -25,3 +25,18 @@ reaper_interval_secs = 5
 # max_ttl_seconds = 86400          # every request must set a ttl_seconds <= this; unbounded VMs are rejected
 # allowed_backends = ["qemu", "firecracker"]
 # allowed_image_dirs = ["/var/lib/ephemera/images"]
+
+# REST API bearer-token auth/RBAC. Absent or empty -> auth is off and every
+# request is treated as admin (the pre-auth MVP default). GET /healthz never
+# requires a token, even when auth is enabled. Generate tokens with
+# something like `openssl rand -hex 32` — these are bearer secrets, treat
+# them like passwords (chmod this file 0600 once you fill them in).
+# [[auth.tokens]]
+# token = "REPLACE_ME_ADMIN_TOKEN"
+# role = "admin"
+# name = "ci"
+#
+# [[auth.tokens]]
+# token = "REPLACE_ME_READONLY_TOKEN"
+# role = "read-only"
+# name = "dashboard"

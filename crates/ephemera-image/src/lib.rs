@@ -160,6 +160,47 @@ fn inject_files_blocking(image: &Path, files: &[CopyIn], services: &[String]) ->
     Ok(())
 }
 
+/// Writes `token` to [`ephemera_guest_protocol::TOKEN_FILE_PATH`] inside
+/// `disk` (an instance's own already-cloned disk — a qcow2 CoW overlay for
+/// QEMU, or a full raw clone for Cloud Hypervisor/Firecracker; either way,
+/// this never touches the shared base image). Runs before the VM's first
+/// boot, so `ephemera-guest-agent`'s systemd unit sees the token file
+/// already in place when it starts. Mode 0600 root-owned — same posture as
+/// an SSH host key, since anything able to read it inside the guest could
+/// impersonate an authenticated caller.
+pub async fn inject_guest_agent_token(disk: &Path, token: &str) -> Result<()> {
+    let disk = disk.to_path_buf();
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || inject_guest_agent_token_blocking(&disk, &token))
+        .await
+        .context("guestkit worker thread panicked")?
+}
+
+fn inject_guest_agent_token_blocking(disk: &Path, token: &str) -> Result<()> {
+    use ephemera_guest_protocol::TOKEN_FILE_PATH;
+    use guestkit::Guestfs;
+
+    let mut g = Guestfs::new().context("creating guestfs handle")?;
+    g.add_drive(disk).with_context(|| format!("adding drive {}", disk.display()))?;
+    g.launch().context("launching guestfs")?;
+
+    let roots = g.inspect_os().context("inspecting guest OS")?;
+    let root = roots.first().context("no operating system found in image")?;
+    let mounts = g.inspect_get_mountpoints(root).context("getting mountpoints")?;
+    for (mountpoint, device) in &mounts {
+        g.mount(device, mountpoint)
+            .with_context(|| format!("mounting {device} at {mountpoint}"))?;
+    }
+
+    g.write(TOKEN_FILE_PATH, token.as_bytes())
+        .with_context(|| format!("writing {TOKEN_FILE_PATH}"))?;
+    g.chmod(0o600, TOKEN_FILE_PATH).context("chmod guest-agent token file")?;
+
+    let _ = g.umount_all();
+    g.shutdown().context("shutting down guestfs")?;
+    Ok(())
+}
+
 async fn image_format(cfg: &Config, image: &Path) -> String {
     ephemera_core::process::output_checked(&cfg.qemu_img_binary, &[
         "info".into(), "--output=json".into(), image.display().to_string()

@@ -24,6 +24,7 @@ pub struct Config {
     pub default_bridge: Option<String>,
     pub reaper_interval_secs: u64,
     pub policy: Policy,
+    pub auth: AuthConfig,
 }
 
 impl Default for Config {
@@ -44,8 +45,54 @@ impl Default for Config {
             default_bridge: Some("vmbr0".into()),
             reaper_interval_secs: 5,
             policy: Policy::default(),
+            auth: AuthConfig::default(),
         }
     }
+}
+
+/// REST API bearer-token auth, enforced by `ephemera-api`'s auth middleware.
+/// Empty `tokens` (the default) disables auth entirely — every request is
+/// treated as [`Role::Admin`] — matching the pre-auth MVP behavior for
+/// operators who haven't opted in. This is separate from, and unrelated to,
+/// the per-VM vsock guest-agent token (`AgentSpec::token`): that one
+/// protects the guest from other host processes; this one protects the
+/// daemon's own HTTP surface from callers who shouldn't reach it at all.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AuthConfig {
+    pub tokens: Vec<ApiToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub token: String,
+    pub role: Role,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// `Admin` can do anything (create/stop/pause/resume/exec/delete/build
+/// images). `ReadOnly` can only list/get VMs — a valid token of either role
+/// is enough to satisfy `/metrics`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    Admin,
+    ReadOnly,
+}
+
+/// Constant-time comparison so a mismatched API token can't be brute-forced
+/// via response-time measurement.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Admission limits enforced by `ephemera_scheduler::validate_policy` before

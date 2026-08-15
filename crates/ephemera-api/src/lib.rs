@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
-use ephemera_core::model::{BackendKind, CreateVmRequest, VmRecord, VmStatus};
+use ephemera_core::{
+    config::{constant_time_eq, Role},
+    model::{BackendKind, CreateVmRequest, VmRecord, VmStatus},
+};
 use ephemera_image::{self as image, BuildImageRequest};
 use ephemera_scheduler::VmManager;
 use serde::Deserialize;
@@ -18,15 +22,57 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 #[derive(Debug)]
-struct ApiError(anyhow::Error);
-impl<E: Into<anyhow::Error>> From<E> for ApiError { fn from(e: E) -> Self { Self(e.into()) } }
+struct ApiError { status: StatusCode, message: String }
+impl<E: Into<anyhow::Error>> From<E> for ApiError {
+    fn from(e: E) -> Self { Self { status: StatusCode::BAD_REQUEST, message: format!("{:#}", e.into()) } }
+}
+impl ApiError {
+    fn forbidden(message: impl Into<String>) -> Self { Self { status: StatusCode::FORBIDDEN, message: message.into() } }
+}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{:#}", self.0)}))).into_response()
+        (self.status, Json(json!({"error": self.message}))).into_response()
     }
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// Bounces a request without a valid bearer token; requests that do have
+/// one carry their resolved `Role` onward as a request extension. When
+/// `cfg.auth.tokens` is empty, auth is off entirely and every request is
+/// treated as `Role::Admin` — this is what makes an un-opted-in deployment
+/// behave exactly like the pre-auth MVP.
+async fn auth_middleware(State(m): State<Arc<VmManager>>, mut req: Request, next: Next) -> Response {
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+    let role = if m.cfg.auth.tokens.is_empty() {
+        Some(Role::Admin)
+    } else {
+        let presented = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        presented.and_then(|t| {
+            m.cfg.auth.tokens.iter().find(|entry| constant_time_eq(&entry.token, t)).map(|entry| entry.role)
+        })
+    };
+    match role {
+        Some(role) => {
+            req.extensions_mut().insert(role);
+            next.run(req).await
+        }
+        None => (StatusCode::UNAUTHORIZED, Json(json!({"error": "missing or invalid bearer token"}))).into_response(),
+    }
+}
+
+fn require_admin(role: Role) -> ApiResult<()> {
+    if role != Role::Admin {
+        return Err(ApiError::forbidden("admin role required"));
+    }
+    Ok(())
+}
 
 pub fn router(manager: Arc<VmManager>) -> Router {
     Router::new()
@@ -39,6 +85,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
+        .layer(middleware::from_fn_with_state(manager.clone(), auth_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(manager)
 }
@@ -94,7 +141,8 @@ fn backend_label(b: BackendKind) -> &'static str {
     }
 }
 
-async fn create_vm(State(m): State<Arc<VmManager>>, Json(req): Json<CreateVmRequest>) -> ApiResult<impl IntoResponse> {
+async fn create_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(req): Json<CreateVmRequest>) -> ApiResult<impl IntoResponse> {
+    require_admin(role)?;
     Ok((StatusCode::CREATED, Json(m.create(req).await?)))
 }
 async fn list_vms(State(m): State<Arc<VmManager>>) -> Json<serde_json::Value> {
@@ -103,13 +151,16 @@ async fn list_vms(State(m): State<Arc<VmManager>>) -> Json<serde_json::Value> {
 async fn get_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!(m.get(id).await?)))
 }
-async fn stop_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+async fn stop_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
     Ok(Json(json!(m.stop(id).await?)))
 }
-async fn pause_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+async fn pause_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
     Ok(Json(json!(m.pause(id).await?)))
 }
-async fn resume_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+async fn resume_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
     Ok(Json(json!(m.resume(id).await?)))
 }
 
@@ -121,17 +172,21 @@ struct ExecRequest {
 }
 async fn agent_exec(
     State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
     Path(id): Path<Uuid>,
     Json(req): Json<ExecRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
     let response = m.exec(id, req.command, req.timeout_seconds).await?;
     Ok(Json(json!(response)))
 }
-async fn delete_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+async fn delete_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+    require_admin(role)?;
     m.delete(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn build_image(State(m): State<Arc<VmManager>>, Json(req): Json<BuildImageRequest>) -> ApiResult<Json<serde_json::Value>> {
+async fn build_image(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(req): Json<BuildImageRequest>) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
     Ok(Json(json!(image::build_image(&m.cfg, &req).await?)))
 }
 
@@ -172,7 +227,7 @@ mod tests {
                 cloud_init: None,
                 ttl_seconds: None,
                 extra_args: vec![],
-                agent: agent_enabled.then(|| AgentSpec { enabled: true, port: 17777 }),
+                agent: agent_enabled.then(|| AgentSpec { enabled: true, port: 17777, token: None }),
             },
             guest_cid: None,
         }
@@ -205,5 +260,100 @@ mod tests {
         let out = render_metrics(&[]);
         assert!(out.contains("ephemera_vms_total{status=\"running\"} 0"));
         assert!(out.contains("ephemera_vms_agent_enabled 0"));
+    }
+
+    mod auth {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request;
+        use ephemera_core::config::{ApiToken, AuthConfig, Config};
+        use tower::ServiceExt;
+
+        fn manager(auth: AuthConfig) -> Arc<VmManager> {
+            let dir = tempfile::tempdir().unwrap();
+            // Leak: the tempdir must outlive every VmManager call in the
+            // test, and these tests are short-lived processes anyway.
+            let dir = Box::leak(Box::new(dir));
+            let cfg = Config {
+                state_dir: dir.path().join("state"),
+                run_dir: dir.path().join("run"),
+                auth,
+                ..Config::default()
+            };
+            VmManager::new(cfg).unwrap()
+        }
+
+        async fn status_for(app: Router, method: &str, uri: &str, bearer: Option<&str>) -> StatusCode {
+            request(app, method, uri, bearer, None).await
+        }
+
+        /// `body` is sent as `application/json` when present — needed for
+        /// any route whose handler takes a `Json<T>` extractor, since axum
+        /// rejects with 415 during extraction (before the handler body, and
+        /// so before this module's `require_admin` role check, ever runs)
+        /// if the request has no JSON content-type at all.
+        async fn request(app: Router, method: &str, uri: &str, bearer: Option<&str>, body: Option<&str>) -> StatusCode {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some(t) = bearer {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            let body = match body {
+                Some(b) => {
+                    builder = builder.header(header::CONTENT_TYPE, "application/json");
+                    Body::from(b.to_string())
+                }
+                None => Body::empty(),
+            };
+            let req = builder.body(body).unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+
+        #[tokio::test]
+        async fn auth_disabled_allows_unauthenticated_requests() {
+            let app = router(manager(AuthConfig::default()));
+            assert_eq!(status_for(app, "GET", "/v1/vms", None).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn missing_token_is_rejected_when_auth_is_enabled() {
+            let auth = AuthConfig { tokens: vec![ApiToken { token: "secret".into(), role: Role::Admin, name: None }] };
+            let app = router(manager(auth));
+            assert_eq!(status_for(app, "GET", "/v1/vms", None).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn wrong_token_is_rejected() {
+            let auth = AuthConfig { tokens: vec![ApiToken { token: "secret".into(), role: Role::Admin, name: None }] };
+            let app = router(manager(auth));
+            assert_eq!(status_for(app, "GET", "/v1/vms", Some("nope")).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn healthz_is_reachable_without_a_token_even_when_auth_is_enabled() {
+            let auth = AuthConfig { tokens: vec![ApiToken { token: "secret".into(), role: Role::Admin, name: None }] };
+            let app = router(manager(auth));
+            assert_eq!(status_for(app, "GET", "/healthz", None).await, StatusCode::OK);
+        }
+
+        const VALID_CREATE_BODY: &str = r#"{"name":"t","backend":"qemu","image":"/does/not/exist.qcow2"}"#;
+
+        #[tokio::test]
+        async fn readonly_token_can_list_but_not_create() {
+            let auth = AuthConfig { tokens: vec![ApiToken { token: "ro".into(), role: Role::ReadOnly, name: None }] };
+            let app = router(manager(auth));
+            assert_eq!(status_for(app.clone(), "GET", "/v1/vms", Some("ro")).await, StatusCode::OK);
+            assert_eq!(request(app, "POST", "/v1/vms", Some("ro"), Some(VALID_CREATE_BODY)).await, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn admin_token_passes_auth_for_a_mutating_route() {
+            let auth = AuthConfig { tokens: vec![ApiToken { token: "admin".into(), role: Role::Admin, name: None }] };
+            let app = router(manager(auth));
+            // The image path doesn't exist, so this fails downstream with
+            // 400 — the point is it's NOT 401/403, i.e. the Admin token
+            // cleared the auth layer and reached VmManager::create.
+            let status = request(app, "POST", "/v1/vms", Some("admin"), Some(VALID_CREATE_BODY)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
     }
 }

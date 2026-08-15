@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -11,7 +11,7 @@ use axum::{
 };
 use ephemera_core::{
     config::{constant_time_eq, Role},
-    model::{BackendKind, CreateVmRequest, VmRecord, VmStatus},
+    model::{BackendKind, ClaimOverrides, CreateVmRequest, PoolSpec, VmRecord, VmStatus},
 };
 use ephemera_image::{self as image, BuildImageRequest};
 use ephemera_scheduler::VmManager;
@@ -85,6 +85,9 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
+        .route("/v1/pools", post(create_pool).get(list_pools))
+        .route("/v1/pools/{name}", get(get_pool).delete(delete_pool))
+        .route("/v1/pools/{name}/claim", post(claim_pool))
         .layer(middleware::from_fn_with_state(manager.clone(), auth_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(manager)
@@ -145,8 +148,23 @@ async fn create_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<R
     require_admin(role)?;
     Ok((StatusCode::CREATED, Json(m.create(req).await?)))
 }
-async fn list_vms(State(m): State<Arc<VmManager>>) -> Json<serde_json::Value> {
-    Json(json!({"items": m.list().await}))
+#[derive(Deserialize)]
+struct ListVmsQuery {
+    /// Exact-match filter on `VmRecord.name`. Added for zyvor-fabric's
+    /// `EphemeraDriver`, which is keyed by name (systemd-machined's model)
+    /// while `VmRecord` is keyed by `Uuid` — this lets the driver resolve a
+    /// name to a record server-side instead of pulling the full list on
+    /// every lookup.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn list_vms(State(m): State<Arc<VmManager>>, Query(q): Query<ListVmsQuery>) -> Json<serde_json::Value> {
+    let mut items = m.list().await;
+    if let Some(name) = q.name {
+        items.retain(|vm| vm.name == name);
+    }
+    Json(json!({"items": items}))
 }
 async fn get_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!(m.get(id).await?)))
@@ -188,6 +206,31 @@ async fn delete_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<R
 async fn build_image(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(req): Json<BuildImageRequest>) -> ApiResult<Json<serde_json::Value>> {
     require_admin(role)?;
     Ok(Json(json!(image::build_image(&m.cfg, &req).await?)))
+}
+
+async fn create_pool(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(spec): Json<PoolSpec>) -> ApiResult<impl IntoResponse> {
+    require_admin(role)?;
+    Ok((StatusCode::CREATED, Json(m.create_pool(spec).await?)))
+}
+async fn list_pools(State(m): State<Arc<VmManager>>) -> Json<serde_json::Value> {
+    Json(json!({"items": m.list_pools().await}))
+}
+async fn get_pool(State(m): State<Arc<VmManager>>, Path(name): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!(m.get_pool(&name).await?)))
+}
+async fn delete_pool(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    require_admin(role)?;
+    m.delete_pool(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn claim_pool(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(name): Path<String>,
+    Json(overrides): Json<ClaimOverrides>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    Ok(Json(json!(m.claim_from_pool(&name, overrides).await?)))
 }
 
 #[cfg(test)]

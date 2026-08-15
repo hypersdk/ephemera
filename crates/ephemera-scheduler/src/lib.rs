@@ -6,12 +6,13 @@ use chrono::{Duration, Utc};
 use ephemera_core::{
     backend::{LaunchContext, VmBackend},
     config::Config,
-    model::{BackendKind, CreateVmRequest, VmRecord, VmStatus},
+    model::{BackendKind, ClaimOverrides, CreateVmRequest, PoolRecord, PoolSpec, VmRecord, VmStatus},
     process,
 };
 use ephemera_guest_protocol::AgentRequest;
-use ephemera_storage::Store;
-use std::{fs, sync::Arc};
+use ephemera_storage::{PoolStore, Store};
+use std::{collections::HashMap, fs, sync::Arc};
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 /// Linux reserves vsock CIDs 0–2 (hypervisor/local/host); guest CIDs start
@@ -95,13 +96,20 @@ fn validate_policy(req: &CreateVmRequest, cfg: &Config) -> Result<()> {
 pub struct VmManager {
     pub cfg: Config,
     pub store: Arc<Store>,
+    pub pools: Arc<PoolStore>,
+    /// One mutex per pool name, created on demand, so concurrent backfill
+    /// triggers for the *same* pool (e.g. `create_pool` and a `claim` racing
+    /// each other) serialize instead of both creating members past `size`;
+    /// backfills for *different* pools still run fully in parallel.
+    backfill_locks: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 impl VmManager {
     pub fn new(cfg: Config) -> Result<Arc<Self>> {
         cfg.ensure_dirs()?;
         let store = Arc::new(Store::load(&cfg.state_dir)?);
-        Ok(Arc::new(Self { cfg, store }))
+        let pools = Arc::new(PoolStore::load(&cfg.state_dir)?);
+        Ok(Arc::new(Self { cfg, store, pools, backfill_locks: AsyncMutex::new(HashMap::new()) }))
     }
 
     pub async fn create(self: &Arc<Self>, mut req: CreateVmRequest) -> Result<VmRecord> {
@@ -296,6 +304,120 @@ impl VmManager {
                 }
             }
         });
+    }
+
+    // ---- Warm VM pools ----
+    //
+    // A pool keeps `size` VMs booted from `template` sitting `Paused`,
+    // ready to be handed out by `claim_from_pool` in resume time (already
+    // fast — see the "Pause, resume, and exec" README section) instead of
+    // full create time. Pool membership (`PoolStore`) and VM lifecycle
+    // (`Store`) are separate, separately-locked stores; the invariant kept
+    // between them is "every id in `PoolRecord::members` is a `Paused`
+    // `VmRecord` not claimed by anyone else," maintained by always popping
+    // a member (removing it from that invariant) before doing anything
+    // with it, and always pushing a newly-created member only after it's
+    // fully paused and ready.
+
+    pub async fn create_pool(self: &Arc<Self>, spec: PoolSpec) -> Result<PoolRecord> {
+        if spec.size == 0 {
+            bail!("pool size must be at least 1");
+        }
+        if self.pools.get(&spec.name).await.is_some() {
+            bail!("pool '{}' already exists", spec.name);
+        }
+        let record = PoolRecord { name: spec.name.clone(), size: spec.size, template: spec.template, members: vec![] };
+        self.pools.insert(record.clone()).await?;
+        self.spawn_backfill(record.name.clone());
+        Ok(record)
+    }
+
+    pub async fn list_pools(&self) -> Vec<PoolRecord> {
+        self.pools.list().await
+    }
+
+    pub async fn get_pool(&self, name: &str) -> Result<PoolRecord> {
+        self.pools.get(name).await.context("pool not found")
+    }
+
+    pub async fn delete_pool(&self, name: &str) -> Result<()> {
+        let record = self.pools.remove(name).await?.context("pool not found")?;
+        for id in record.members {
+            let _ = self.delete(id).await;
+        }
+        Ok(())
+    }
+
+    /// Pops one ready member off `name`'s pool, resumes it (fast — the
+    /// member was already fully booted and paused ahead of time), applies
+    /// `overrides`, and triggers a backfill to replace it. Fails with a
+    /// clear "no ready members" error rather than falling back to a slow
+    /// synchronous create — a caller who wants that can just call
+    /// `create()` directly instead of `claim_from_pool`.
+    pub async fn claim_from_pool(self: &Arc<Self>, name: &str, overrides: ClaimOverrides) -> Result<VmRecord> {
+        let Some(id) = self.pools.pop_member(name).await? else {
+            bail!("pool '{name}' has no ready members right now — try again shortly, or increase its size");
+        };
+        self.spawn_backfill(name.to_string());
+
+        let mut vm = match self.resume(id).await {
+            Ok(vm) => vm,
+            Err(e) => {
+                // Already popped, so no one else can claim it — clean up
+                // rather than leak a paused-but-broken VM outside any
+                // pool's accounting.
+                let _ = self.delete(id).await;
+                return Err(e).context("resuming claimed pool member");
+            }
+        };
+        if let Some(new_name) = overrides.name {
+            vm.request.name = new_name.clone();
+            vm.name = new_name;
+        }
+        vm.request.ttl_seconds = overrides.ttl_seconds;
+        vm.expires_at = overrides.ttl_seconds.map(|s| Utc::now() + Duration::seconds(s as i64));
+        self.store.update(vm.clone()).await?;
+        Ok(vm)
+    }
+
+    fn spawn_backfill(self: &Arc<Self>, pool_name: String) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = me.backfill_pool(&pool_name).await {
+                tracing::warn!(pool = %pool_name, error = ?e, "pool backfill failed");
+            }
+        });
+    }
+
+    async fn backfill_lock(&self, name: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.backfill_locks.lock().await;
+        locks.entry(name.to_string()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone()
+    }
+
+    async fn backfill_pool(self: &Arc<Self>, name: &str) -> Result<()> {
+        // Serializes backfill runs for THIS pool only (create_pool's
+        // initial fill and a claim's replenishment can race each other);
+        // backfills for other pools take a different lock and proceed
+        // concurrently.
+        let lock = self.backfill_lock(name).await;
+        let _guard = lock.lock().await;
+
+        loop {
+            let Some(record) = self.pools.get(name).await else { return Ok(()) }; // pool deleted meanwhile
+            if record.members.len() >= record.size {
+                return Ok(());
+            }
+            let mut req = record.template.clone();
+            req.name = format!("{name}-pool-{}", Uuid::new_v4());
+            req.ttl_seconds = None; // a paused pool member must never expire on its own
+            let vm = self.create(req).await.context("creating pool member")?;
+            let paused = self.pause(vm.id).await.context("pausing new pool member")?;
+            if !self.pools.push_member(name, paused.id).await? {
+                // Pool was deleted while this member was being created.
+                let _ = self.delete(paused.id).await;
+                return Ok(());
+            }
+        }
     }
 }
 

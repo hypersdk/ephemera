@@ -13,7 +13,7 @@
 //! processes, not just within one.
 
 use anyhow::{bail, Context, Result};
-use ephemera_core::model::VmRecord;
+use ephemera_core::model::{PoolRecord, VmRecord};
 use std::{collections::HashMap, fs, os::unix::io::AsRawFd, path::{Path, PathBuf}};
 use uuid::Uuid;
 
@@ -143,6 +143,130 @@ impl Store {
     }
 }
 
+/// Same flock-per-operation, read-fresh-under-lock discipline as [`Store`]
+/// (see the module doc comment for why that matters across separate CLI
+/// processes), applied to warm-pool records instead of VM records, keyed by
+/// pool name and persisted in its own `pools.json`/`pools.lock` pair. Kept
+/// as a separate small type rather than a generic `Store<K, V>` — the two
+/// have different enough key types and call sites that a shared abstraction
+/// would cost more in indirection than the ~40 lines it'd save.
+pub struct PoolStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl PoolStore {
+    pub fn load(state_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            path: state_dir.join("pools.json"),
+            lock_path: state_dir.join("pools.lock"),
+        })
+    }
+
+    fn read_map(path: &Path) -> Result<HashMap<String, PoolRecord>> {
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let raw = fs::read_to_string(path).context("reading pool state")?;
+        if raw.trim().is_empty() {
+            return Ok(HashMap::new());
+        }
+        serde_json::from_str(&raw).context("parsing pool state")
+    }
+
+    async fn with_exclusive<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut HashMap<String, PoolRecord>) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let path = self.path.clone();
+        let lock_path = self.lock_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<T> {
+            let lock_file = fs::OpenOptions::new().create(true).write(true).open(&lock_path)
+                .context("opening pool store lock file")?;
+            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                bail!("locking pool store: {}", std::io::Error::last_os_error());
+            }
+            let mut map = Self::read_map(&path)?;
+            let result = f(&mut map);
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, serde_json::to_vec_pretty(&map)?).context("writing pool state")?;
+            fs::rename(&tmp, &path).context("renaming pool state")?;
+            Ok(result)
+        })
+        .await
+        .context("pool store worker thread panicked")?
+    }
+
+    async fn with_shared<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&HashMap<String, PoolRecord>) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let path = self.path.clone();
+        let lock_path = self.lock_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<T> {
+            let lock_file = fs::OpenOptions::new().create(true).write(true).open(&lock_path)
+                .context("opening pool store lock file")?;
+            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+                bail!("locking pool store: {}", std::io::Error::last_os_error());
+            }
+            let map = Self::read_map(&path)?;
+            Ok(f(&map))
+        })
+        .await
+        .context("pool store worker thread panicked")?
+    }
+
+    pub async fn insert(&self, pool: PoolRecord) -> Result<()> {
+        self.with_exclusive(move |m| {
+            m.insert(pool.name.clone(), pool);
+        })
+        .await
+    }
+
+    pub async fn get(&self, name: &str) -> Option<PoolRecord> {
+        let name = name.to_string();
+        self.with_shared(move |m| m.get(&name).cloned()).await.ok().flatten()
+    }
+
+    pub async fn list(&self) -> Vec<PoolRecord> {
+        self.with_shared(|m| {
+            let mut v: Vec<_> = m.values().cloned().collect();
+            v.sort_by_key(|p| p.name.clone());
+            v
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub async fn remove(&self, name: &str) -> Result<Option<PoolRecord>> {
+        let name = name.to_string();
+        self.with_exclusive(move |m| m.remove(&name)).await
+    }
+
+    /// Atomically pops one member id off `name`'s pool (so two concurrent
+    /// claims can never receive the same VM) and returns it, or `None` if
+    /// the pool has no ready members right now.
+    pub async fn pop_member(&self, name: &str) -> Result<Option<Uuid>> {
+        let name = name.to_string();
+        self.with_exclusive(move |m| m.get_mut(&name).and_then(|p| p.members.pop())).await
+    }
+
+    /// Atomically appends a freshly-backfilled member id to `name`'s pool.
+    /// A no-op (not an error) if the pool was deleted concurrently — the
+    /// backfill task that produced `member` should then just clean it up
+    /// itself rather than resurrect a deleted pool.
+    pub async fn push_member(&self, name: &str, member: Uuid) -> Result<bool> {
+        let name = name.to_string();
+        self.with_exclusive(move |m| match m.get_mut(&name) {
+            Some(p) => { p.members.push(member); true }
+            None => false,
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +393,84 @@ mod tests {
 
         let store = Store::load(&path).unwrap();
         assert_eq!(store.list().await.len(), 8, "no concurrent write should have been silently lost");
+    }
+
+    fn fixture_pool(name: &str) -> ephemera_core::model::PoolRecord {
+        ephemera_core::model::PoolRecord {
+            name: name.to_string(),
+            size: 2,
+            template: fixture_record("template").request,
+            members: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_insert_get_list_remove_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PoolStore::load(dir.path()).unwrap();
+        store.insert(fixture_pool("a")).await.unwrap();
+
+        assert_eq!(store.get("a").await.unwrap().size, 2);
+        assert_eq!(store.list().await.len(), 1);
+        assert!(store.remove("a").await.unwrap().is_some());
+        assert!(store.get("a").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn push_and_pop_member_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PoolStore::load(dir.path()).unwrap();
+        store.insert(fixture_pool("a")).await.unwrap();
+
+        let id = Uuid::new_v4();
+        assert!(store.push_member("a", id).await.unwrap());
+        assert_eq!(store.get("a").await.unwrap().members, vec![id]);
+
+        let popped = store.pop_member("a").await.unwrap();
+        assert_eq!(popped, Some(id));
+        assert!(store.get("a").await.unwrap().members.is_empty());
+        assert_eq!(store.pop_member("a").await.unwrap(), None, "popping an empty pool must not error");
+    }
+
+    #[tokio::test]
+    async fn push_member_on_deleted_pool_is_a_harmless_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PoolStore::load(dir.path()).unwrap();
+        // No insert — "a" was never created (or was already deleted).
+        assert!(!store.push_member("a", Uuid::new_v4()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pop_member_is_race_free_across_concurrent_processes() {
+        // Same regression shape as insert_with_cid_is_race_free_across_concurrent_processes:
+        // each task gets its OWN PoolStore (a fresh load(), simulating a
+        // separate `ephemera pool claim` CLI invocation), racing to pop
+        // members off a pool pre-seeded with 8 — a real bug here would let
+        // two concurrent claims hand out the same VM id.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let store = PoolStore::load(&path).unwrap();
+        let mut seeded = fixture_pool("a");
+        seeded.members = (0..8).map(|_| Uuid::new_v4()).collect();
+        let all_ids: HashSet<Uuid> = seeded.members.iter().copied().collect();
+        store.insert(seeded).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            handles.push(tokio::spawn(async move {
+                let store = PoolStore::load(&path).unwrap();
+                store.pop_member("a").await.unwrap()
+            }));
+        }
+        let mut popped = Vec::new();
+        for h in handles {
+            popped.push(h.await.unwrap().expect("every claim should get a member — 8 popped from 8 seeded"));
+        }
+
+        let unique: HashSet<Uuid> = popped.iter().copied().collect();
+        assert_eq!(unique.len(), popped.len(), "no two concurrent claims may pop the same member: {popped:?}");
+        assert_eq!(unique, all_ids);
+        assert!(store.get("a").await.unwrap().members.is_empty());
     }
 }

@@ -163,3 +163,44 @@ pub struct VmRecord {
     #[serde(default)]
     pub guest_cid: Option<u32>,
 }
+
+/// A named template for a warm pool: `size` VMs matching `template` are
+/// kept pre-booted-and-`Paused`, ready to be handed out by
+/// `VmManager::claim_from_pool` in roughly resume-time (already fast — see
+/// "Pause, resume, and exec") instead of full create-time. `template.name`
+/// and `template.ttl_seconds` are ignored for pool members (a paused pool
+/// member must never expire on its own; the claimed VM gets a fresh name/TTL
+/// at claim time — see `ClaimOverrides`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolSpec {
+    pub name: String,
+    pub size: usize,
+    pub template: CreateVmRequest,
+}
+
+/// Persisted state of a warm pool: which VM ids are currently reserved
+/// members (booted, paused, unclaimed). A member id present here always
+/// corresponds to a real `Paused` `VmRecord` in the main VM store — the two
+/// are kept in sync by `VmManager`, not merged into one store, since pool
+/// membership and VM lifecycle are different concerns with different
+/// locking needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolRecord {
+    pub name: String,
+    pub size: usize,
+    pub template: CreateVmRequest,
+    #[serde(default)]
+    pub members: Vec<Uuid>,
+}
+
+/// Applied to the VM handed back by a pool claim, replacing whatever the
+/// template said for these two fields (a pool member is paused with no name
+/// worth keeping and no TTL, precisely so it never expires while idle in
+/// the pool).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClaimOverrides {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}

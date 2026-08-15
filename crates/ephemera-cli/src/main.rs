@@ -4,7 +4,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ephemera_api as api;
-use ephemera_core::{config::Config, model::CreateVmRequest};
+use ephemera_core::{
+    config::Config,
+    model::{ClaimOverrides, CreateVmRequest},
+};
 use ephemera_image::{self as image, BuildImageRequest};
 use ephemera_scheduler::VmManager;
 use std::{path::PathBuf, sync::Arc};
@@ -40,6 +43,28 @@ enum Command {
     },
     Delete { id: Uuid },
     BuildImage { #[arg(long)] spec: PathBuf },
+    /// Manage warm VM pools — pre-booted, paused VMs handed out on claim in
+    /// roughly resume time instead of full create time.
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolCommand {
+    Create { #[arg(long)] spec: PathBuf },
+    List,
+    Get { name: String },
+    /// Claim one ready VM from the pool (backfill happens automatically).
+    Claim {
+        name: String,
+        #[arg(long)]
+        vm_name: Option<String>,
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    Delete { name: String },
 }
 
 async fn manager(cfg: Config) -> Result<Arc<VmManager>> { VmManager::new(cfg) }
@@ -78,6 +103,19 @@ async fn main() -> Result<()> {
             let req: BuildImageRequest = serde_json::from_slice(&std::fs::read(spec)?)?;
             println!("{}", serde_json::to_string_pretty(&image::build_image(&cfg, &req).await?)?);
         }
+        Command::Pool { command } => match command {
+            PoolCommand::Create { spec } => {
+                let spec = serde_json::from_slice(&std::fs::read(spec)?)?;
+                println!("{}", serde_json::to_string_pretty(&m.create_pool(spec).await?)?);
+            }
+            PoolCommand::List => println!("{}", serde_json::to_string_pretty(&m.list_pools().await)?),
+            PoolCommand::Get { name } => println!("{}", serde_json::to_string_pretty(&m.get_pool(&name).await?)?),
+            PoolCommand::Claim { name, vm_name, ttl_seconds } => {
+                let overrides = ClaimOverrides { name: vm_name, ttl_seconds };
+                println!("{}", serde_json::to_string_pretty(&m.claim_from_pool(&name, overrides).await?)?);
+            }
+            PoolCommand::Delete { name } => m.delete_pool(&name).await?,
+        },
     }
     Ok(())
 }

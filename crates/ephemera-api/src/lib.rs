@@ -93,6 +93,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/logs", get(vm_logs))
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
+        .route("/v1/images/catalog", get(list_catalog))
         .route("/v1/pools", post(create_pool).get(list_pools))
         .route("/v1/pools/{name}", get(get_pool).delete(delete_pool))
         .route("/v1/pools/{name}/claim", post(claim_pool))
@@ -331,6 +332,13 @@ async fn delete_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<R
 async fn build_image(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(req): Json<BuildImageRequest>) -> ApiResult<Json<serde_json::Value>> {
     require_admin(role)?;
     Ok(Json(json!(image::build_image(&m.cfg, &req).await?)))
+}
+
+/// Read-only (no role check beyond a valid token, like other GET routes) —
+/// signing itself is a CLI/offline operation (`ephemera catalog sign`), not
+/// exposed here, so private keys never touch this API's surface.
+async fn list_catalog(State(m): State<Arc<VmManager>>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!({"items": image::catalog::list_with_verification(&m.cfg)?})))
 }
 
 async fn create_pool(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(spec): Json<PoolSpec>) -> ApiResult<impl IntoResponse> {

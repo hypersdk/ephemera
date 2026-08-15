@@ -538,6 +538,53 @@ This is how the guest agent gets baked into an image:
 }
 ```
 
+## Image catalog & signing
+
+Reference a named, checksummed image instead of a raw path or URL — resolved transparently by
+`create` before policy/existence checks, so `allowed_image_dirs` still governs the real resolved file:
+
+```json
+{"name": "job-1", "backend": "qemu", "image": "ubuntu-24.04", "...": "..."}
+```
+
+Enable it with `[catalog]` in the config:
+
+```toml
+[catalog]
+path = "/etc/ephemera/catalog.json"
+trusted_signers = []   # empty = signatures not required; non-empty = every entry MUST verify
+```
+
+An image reference that doesn't match any catalog entry's `name` is treated as a literal path/URL,
+exactly like before this existed — the catalog is purely additive.
+
+Signing is a self-contained Ed25519 scheme (not cosign/Sigstore, which need either a local `cosign`
+binary or a live Fulcio/Rekor round trip — neither of which this project can verify end-to-end without
+external network-dependent test infrastructure):
+
+```bash
+ephemera catalog keygen
+#   private key (keep secret, use with `catalog sign --key`): ...
+#   public key (put in config.catalog.trusted_signers): ...
+
+ephemera catalog sign \
+  --key <private-key> --name ubuntu-24.04 \
+  --source https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img \
+  --sha256 <sha256> --distro ubuntu --version 24.04 --arch x86_64 \
+  --catalog-file /etc/ephemera/catalog.json   # appends/updates in place; omit to just print the entry
+```
+
+With `trusted_signers` set, an unsigned (or wrongly-signed) catalog entry is rejected at `create` time
+— fails closed, no silent fallback to "unsigned is fine." `GET /v1/images/catalog` lists every entry
+with a computed `signature_valid` (read-only; signing stays a CLI/offline operation, so private keys
+never touch the API surface).
+
+Verified on real hardware (`scripts/test-image-catalog.sh`, 10/10): `keygen`/`sign` produce a real
+verifiable entry; creating a VM by catalog name actually resolves and boots the underlying image; with
+`trusted_signers` configured, an unsigned entry is rejected while a validly signed one is accepted (both
+confirmed by actually trying to boot); a plain literal path still works unchanged; `GET
+/v1/images/catalog` correctly reports `signature_valid: true`/`false` for the two cases.
+
 ## REST API
 
 Start the server:
@@ -574,6 +621,7 @@ GET    /v1/vms/{uuid}/logs
 POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
+GET    /v1/images/catalog
 POST   /v1/pools
 GET    /v1/pools
 GET    /v1/pools/{name}
@@ -750,7 +798,7 @@ assigned the same vsock CID.
 2. **Network namespace policy** — one namespace per VM (veth + NAT + internal bridge) is already implemented and opt-in per VM (see "Network namespaces" above); still missing: nftables instead of one flat iptables MASQUERADE rule per VM, and real IPAM (subnets are derived deterministically from the VM id rather than tracked/reused, a documented theoretical-collision tradeoff).
 3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
-5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
+5. **Image catalog** — already implemented: named/checksummed/Ed25519-signed entries, distro/version/arch metadata (see "Image catalog & signing" above). Not done: a cosign/Sigstore option specifically, for shops standardized on that instead of this project's own signing scheme.
 6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).
 7. **Auth** — mTLS/OIDC, tenant IDs and audit events. Bearer-token REST auth/RBAC (admin/read-only) and a per-VM authenticated guest-agent protocol are already implemented; see "Auth / RBAC" and "Pause, resume, and exec" above.
 8. **Observability** — tracing, per-VM boot timing and failure reasons (a basic Prometheus `/metrics` endpoint — VM counts by status/backend, agent-enabled count — is already implemented; see the REST API section).

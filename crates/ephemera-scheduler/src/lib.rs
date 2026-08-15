@@ -234,6 +234,10 @@ impl VmManager {
         // (the disk filename, the persisted record, the launch dispatch)
         // assumes a concrete backend and must never see Auto.
         req.backend = resolve_backend(&req, &self.cfg);
+        // Resolved before policy so allowed_image_dirs governs the actual
+        // downloaded/verified file a catalog alias points to, not the
+        // alias string itself.
+        req.image = ephemera_image::catalog::resolve(&self.cfg, &req.image).await.context("resolving image from catalog")?;
         validate_policy(&req, &self.cfg)?;
         if !req.image.exists() { bail!("base image does not exist: {}", req.image.display()); }
         let id = Uuid::new_v4();

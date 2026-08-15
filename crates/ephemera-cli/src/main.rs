@@ -52,6 +52,47 @@ enum Command {
         #[command(subcommand)]
         command: PoolCommand,
     },
+    /// Manage the named/checksummed/optionally-signed image catalog (see
+    /// config.catalog). Referencing a catalog name in a VM spec's `image`
+    /// field (instead of a raw path) is handled automatically by `create` —
+    /// these subcommands are only for building/signing the catalog itself.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// Generate a fresh Ed25519 keypair for signing catalog entries. The
+    /// private key is only ever printed here — store it yourself (this
+    /// project has no opinion on how); put the public key into
+    /// config.catalog.trusted_signers to require it going forward.
+    Keygen,
+    /// Sign a catalog entry and print it as JSON, or append it to
+    /// --catalog-file if given (creating the file with an empty array
+    /// first if it doesn't exist yet).
+    Sign {
+        /// Base64 Ed25519 private key, as printed by `catalog keygen`.
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        sha256: String,
+        #[arg(long, default_value = "qcow2")]
+        format: String,
+        #[arg(long)]
+        distro: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        arch: Option<String>,
+        #[arg(long)]
+        catalog_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -133,6 +174,30 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&m.claim_from_pool(&name, overrides).await?)?);
             }
             PoolCommand::Delete { name } => m.delete_pool(&name).await?,
+        },
+        Command::Catalog { command } => match command {
+            CatalogCommand::Keygen => {
+                let (private_b64, public_b64) = image::catalog::generate_keypair();
+                println!("private key (keep secret, use with `catalog sign --key`):\n  {private_b64}");
+                println!("public key (put in config.catalog.trusted_signers):\n  {public_b64}");
+            }
+            CatalogCommand::Sign { key, name, source, sha256, format, distro, version, arch, catalog_file } => {
+                let entry = image::catalog::sign_entry(&key, name, source, sha256, format, distro, version, arch)?;
+                match catalog_file {
+                    Some(path) => {
+                        let mut entries: Vec<image::catalog::CatalogEntry> = if path.exists() {
+                            serde_json::from_slice(&std::fs::read(&path)?)?
+                        } else {
+                            Vec::new()
+                        };
+                        entries.retain(|e| e.name != entry.name);
+                        entries.push(entry);
+                        std::fs::write(&path, serde_json::to_vec_pretty(&entries)?)?;
+                        println!("{}", serde_json::to_string_pretty(&entries)?);
+                    }
+                    None => println!("{}", serde_json::to_string_pretty(&entry)?),
+                }
+            }
         },
     }
     Ok(())

@@ -1,6 +1,7 @@
 // Copyright 2026 Zyvor
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod catalog;
 pub mod cloudinit;
 
 use anyhow::{bail, Context, Result};
@@ -57,7 +58,7 @@ pub struct BuildImageResult {
     pub format: String,
 }
 
-async fn fetch_if_needed(cfg: &Config, source: &str) -> Result<PathBuf> {
+pub(crate) async fn fetch_if_needed(cfg: &Config, source: &str) -> Result<PathBuf> {
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return Ok(PathBuf::from(source));
     }
@@ -72,7 +73,7 @@ async fn fetch_if_needed(cfg: &Config, source: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn verify_sha256(path: &Path, wanted: &str) -> Result<()> {
+pub(crate) fn verify_sha256(path: &Path, wanted: &str) -> Result<()> {
     let bytes = fs::read(path)?;
     let got = format!("{:x}", Sha256::digest(&bytes));
     if !got.eq_ignore_ascii_case(wanted) { bail!("sha256 mismatch: expected {wanted}, got {got}"); }

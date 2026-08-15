@@ -13,8 +13,14 @@ ephemera-core = { path = "../ephemera-core" }
 ephemera-guest-protocol = { path = "../ephemera-guest-protocol" }
 guestkit = { path = "../../../guestkit" }
 anyhow = "1"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

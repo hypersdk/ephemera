@@ -26,6 +26,7 @@ pub struct Config {
     pub policy: Policy,
     pub auth: AuthConfig,
     pub jailer: JailerConfig,
+    pub catalog: CatalogConfig,
 }
 
 impl Default for Config {
@@ -48,8 +49,24 @@ impl Default for Config {
             policy: Policy::default(),
             auth: AuthConfig::default(),
             jailer: JailerConfig::default(),
+            catalog: CatalogConfig::default(),
         }
     }
+}
+
+/// Named, checksummed, optionally-signed base images — see
+/// `ephemera_image::catalog`. `path: None` (the default) disables the
+/// catalog entirely: `CreateVmRequest.image` is always treated as a literal
+/// path/URL, exactly like before this existed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CatalogConfig {
+    pub path: Option<PathBuf>,
+    /// Base64-encoded Ed25519 public keys. Empty (the default) means
+    /// catalog entries don't need to be signed at all. Non-empty means
+    /// *every* catalog entry used to create a VM must carry a valid
+    /// signature from one of these keys — there is no per-entry opt-out.
+    pub trusted_signers: Vec<String>,
 }
 
 /// Firecracker-only: runs the VM through Firecracker's own `jailer` binary

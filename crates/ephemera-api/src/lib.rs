@@ -90,6 +90,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/frozen", get(vm_frozen))
         .route("/v1/vms/{id}/stats", get(vm_stats))
         .route("/v1/vms/{id}/pressure", get(vm_pressure))
+        .route("/v1/vms/{id}/logs", get(vm_logs))
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
         .route("/v1/pools", post(create_pool).get(list_pools))
@@ -226,6 +227,84 @@ async fn vm_stats(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiR
 
 async fn vm_pressure(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!(m.pressure(id).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    follow: bool,
+    #[serde(default = "default_log_lines")]
+    lines: usize,
+}
+fn default_log_lines() -> usize { 100 }
+
+/// `GET /v1/vms/{id}/logs?lines=N&follow=true` — tail-follow the VM's
+/// captured console output (`VmRecord.log_path`) as a plain-text chunked
+/// stream, one line per chunk. Raw serial output has no journald-equivalent
+/// structure (no per-line priority/unit), so unlike `machinectl-driver`'s
+/// `journalctl --output=json` this is deliberately unstructured — the
+/// caller (`ephemera-driver::LogDriver`) assigns a constant priority when
+/// wrapping lines into `driver-core::LogEntry`.
+async fn vm_logs(
+    State(m): State<Arc<VmManager>>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<LogsQuery>,
+) -> ApiResult<Response> {
+    let record = m.get(id).await?;
+    let path = record.log_path;
+    let follow = q.follow;
+    let lines = q.lines.max(1);
+
+    let stream = async_stream::stream! {
+        use std::collections::VecDeque;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => {
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!("error opening log: {e}\n")));
+                return;
+            }
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+
+        // First pass: keep only the last `lines` lines already on disk.
+        let mut tail: VecDeque<String> = VecDeque::with_capacity(lines);
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tail.len() == lines {
+                        tail.pop_front();
+                    }
+                    tail.push_back(std::mem::take(&mut line));
+                }
+                Err(_) => break,
+            }
+        }
+        for l in tail {
+            yield Ok::<_, std::io::Error>(bytes::Bytes::from(l));
+        }
+
+        if follow {
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                    Ok(_) => yield Ok::<_, std::io::Error>(bytes::Bytes::from(std::mem::take(&mut line))),
+                    Err(_) => break,
+                }
+            }
+        }
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap())
 }
 
 #[derive(Deserialize)]

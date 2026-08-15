@@ -534,6 +534,7 @@ POST   /v1/vms/{uuid}/thaw
 GET    /v1/vms/{uuid}/frozen
 GET    /v1/vms/{uuid}/stats
 GET    /v1/vms/{uuid}/pressure
+GET    /v1/vms/{uuid}/logs
 POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
@@ -552,6 +553,12 @@ needs running again.
 `GET /metrics` returns Prometheus text-exposition-format gauges: `ephemera_vms_total{status="..."}`,
 `ephemera_vms_by_backend{backend="..."}`, and `ephemera_vms_agent_enabled` — point a Prometheus
 `scrape_config` at it directly, no exporter needed.
+
+`GET /v1/vms/{uuid}/logs?lines=N&follow=true` streams the VM's captured console output (raw serial,
+no per-line structure) as chunked plain text — `lines` (default 100) controls how much history to
+send before either ending (default) or switching to a live tail (`follow=true`, polling the log file
+every 300ms for new lines). Verified against a real booting VM: both the initial tail and the live
+follow stream return real, growing boot output.
 
 ### Auth / RBAC
 

@@ -147,7 +147,8 @@ async fn launch_direct(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext)
         "--api-sock".into(), api.display().to_string(),
         "--config-file".into(), cfg_path.display().to_string(),
     ];
-    let child = spawn_logged(&cfg.firecracker_binary, &args, &ctx.log_path).await?;
+    let (program, args) = ephemera_core::process::netns_wrap(ctx.network.netns.as_deref(), &cfg.firecracker_binary, &args);
+    let child = spawn_logged(&program, &args, &ctx.log_path).await?;
     let pid = child.id().context("Firecracker exited before PID was available")?;
     Ok(LaunchResult { pid, control_socket: Some(api), jail_path: None, vsock_socket: ctx.vsock_socket.clone() })
 }
@@ -225,7 +226,8 @@ async fn launch_jailed(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext)
         "--api-sock".into(), "/run/firecracker.socket".into(),
         "--config-file".into(), "/config.json".into(),
     ];
-    let child = spawn_logged(&cfg.jailer.jailer_binary, &jailer_args, &ctx.log_path).await?;
+    let (program, jailer_args) = ephemera_core::process::netns_wrap(ctx.network.netns.as_deref(), &cfg.jailer.jailer_binary, &jailer_args);
+    let child = spawn_logged(&program, &jailer_args, &ctx.log_path).await?;
     let pid = child.id().context("jailer exited before PID was available")?;
 
     let vsock_socket_host = vsock_in_jail.as_ref().map(|_| chroot_root.join("vsock.sock"));

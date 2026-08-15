@@ -72,7 +72,8 @@ impl VmBackend for CloudHypervisorBackend {
 
     async fn launch(&self, cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Result<LaunchResult> {
         let args = build_args(cfg, req, ctx)?;
-        let spawned = spawn_logged(&cfg.cloud_hypervisor_binary, &args, &ctx.log_path).await;
+        let (program, args) = ephemera_core::process::netns_wrap(ctx.network.netns.as_deref(), &cfg.cloud_hypervisor_binary, &args);
+        let spawned = spawn_logged(&program, &args, &ctx.log_path).await;
         if let Some(fd) = ctx.network.macvtap_fd {
             ephemera_core::process::close_fd(fd);
         }

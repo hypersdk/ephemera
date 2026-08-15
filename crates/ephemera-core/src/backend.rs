@@ -15,6 +15,13 @@ pub struct PreparedNetwork {
     /// For `NetworkSpec::Macvtap`: a pre-opened, exec-inheritable fd for the
     /// device's `/dev/tapN` character device, passed to the VMM as `fd=`.
     pub macvtap_fd: Option<i32>,
+    /// Set for `NetworkSpec::Tap { netns: true, .. }`: the private network
+    /// namespace `tap_name` was created inside. Every backend's `launch`
+    /// must run the VMM process itself inside this namespace (`ip netns
+    /// exec`) — see `ephemera_core::process::netns_wrap` — or it won't be
+    /// able to open the tap device at all (it lives in a different network
+    /// namespace than the VMM process would otherwise be in).
+    pub netns: Option<String>,
 }
 
 #[derive(Debug, Clone)]

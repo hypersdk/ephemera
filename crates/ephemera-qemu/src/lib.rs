@@ -84,7 +84,8 @@ impl VmBackend for QemuBackend {
 
     async fn launch(&self, cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Result<LaunchResult> {
         let args = build_args(req, ctx)?;
-        let spawned = spawn_logged(&cfg.qemu_binary, &args, &ctx.log_path).await;
+        let (program, args) = ephemera_core::process::netns_wrap(ctx.network.netns.as_deref(), &cfg.qemu_binary, &args);
+        let spawned = spawn_logged(&program, &args, &ctx.log_path).await;
         // The child inherits the macvtap fd across exec (or spawn failed and
         // there's nothing to inherit); either way the parent's copy is done.
         if let Some(fd) = ctx.network.macvtap_fd {

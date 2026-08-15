@@ -401,6 +401,7 @@ mod tests {
             jail_path: None,
             vsock_socket: None,
             cgroup_path: None,
+            netns: None,
         }
     }
 

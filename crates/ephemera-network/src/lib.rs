@@ -1,6 +1,8 @@
 // Copyright 2026 Zyvor
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod netns;
+
 use anyhow::{bail, Context, Result};
 use ephemera_core::{backend::PreparedNetwork, config::Config, model::NetworkSpec, process::run_checked};
 use std::ffi::CString;
@@ -12,8 +14,18 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
             spec: spec.clone(),
             tap_name: None,
             macvtap_fd: None,
+            netns: None,
         }),
-        NetworkSpec::Tap { tap_name, bridge, mac } => {
+        NetworkSpec::Tap { tap_name, bridge, mac, netns: use_netns } if *use_netns => {
+            let handle = netns::prepare(id, mac.as_deref()).await.context("preparing network namespace")?;
+            Ok(PreparedNetwork {
+                spec: NetworkSpec::Tap { tap_name: Some(handle.tap_name.clone()), bridge: bridge.clone(), mac: mac.clone(), netns: true },
+                tap_name: Some(handle.tap_name),
+                macvtap_fd: None,
+                netns: Some(handle.netns),
+            })
+        }
+        NetworkSpec::Tap { tap_name, bridge, mac, .. } => {
             let tap = tap_name.clone().unwrap_or_else(|| format!("eph{}", &id.simple().to_string()[..8]));
             if tap.len() > 15 { bail!("tap interface name must be <= 15 characters"); }
             let bridge = bridge.clone().or_else(|| cfg.default_bridge.clone());
@@ -27,9 +39,10 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
                 }
             }
             Ok(PreparedNetwork {
-                spec: NetworkSpec::Tap { tap_name: Some(tap.clone()), bridge, mac: mac.clone() },
+                spec: NetworkSpec::Tap { tap_name: Some(tap.clone()), bridge, mac: mac.clone(), netns: false },
                 tap_name: Some(tap),
                 macvtap_fd: None,
+                netns: None,
             })
         }
         NetworkSpec::Macvtap { parent, macvtap_mode, mac } => {
@@ -54,6 +67,7 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
                     spec: spec.clone(),
                     tap_name: Some(name),
                     macvtap_fd: Some(fd),
+                    netns: None,
                 }),
                 Err(e) => {
                     let _ = cleanup_macvtap(&name).await;
@@ -86,10 +100,17 @@ async fn open_macvtap_fd(name: &str) -> Result<i32> {
 /// Dispatches cleanup of the ephemeral network device recorded for a VM,
 /// based on which kind it is (TAP vs. macvtap use different deletion
 /// commands).
-pub async fn cleanup(spec: &NetworkSpec, name: &str) -> Result<()> {
+pub async fn cleanup(id: Uuid, spec: &NetworkSpec, tap_name: &str, netns_name: Option<&str>) -> Result<()> {
+    // Deleting the namespace tears down everything inside it (the tap
+    // included) — no separate tap cleanup needed, and calling
+    // cleanup_tap/cleanup_macvtap for a namespaced tap would fail anyway
+    // (it doesn't exist in the host's own namespace to delete).
+    if let Some(ns) = netns_name {
+        return netns::cleanup(id, ns).await;
+    }
     match spec {
-        NetworkSpec::Macvtap { .. } => cleanup_macvtap(name).await,
-        _ => cleanup_tap(name).await,
+        NetworkSpec::Macvtap { .. } => cleanup_macvtap(tap_name).await,
+        _ => cleanup_tap(tap_name).await,
     }
 }
 

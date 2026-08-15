@@ -9,7 +9,7 @@ Firecracker, Cloud Hypervisor, and QEMU/KVM from one Rust-native control plane.
 
 It also contains a small **virt-builder-style image pipeline**: use a local/HTTP base image, verify SHA-256, convert/resize it, and customize it with `virt-customize`.
 
-> This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC, the Firecracker jailer (chroot + uid/gid isolation), and cgroup v2 resource control are already implemented (see "Auth / RBAC", "Firecracker jailer", and "Resource control (cgroup v2)" below) — before exposing it to untrusted tenants, still add seccomp/AppArmor/SELinux policy, per-tenant network namespaces, quotas, audit logging and stronger image provenance.
+> This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC, the Firecracker jailer (chroot + uid/gid isolation), cgroup v2 resource control, and per-VM network namespaces are already implemented (see "Auth / RBAC", "Firecracker jailer", "Resource control (cgroup v2)", and "Network namespaces" below) — before exposing it to untrusted tenants, still add seccomp/AppArmor/SELinux policy, quotas, audit logging and stronger image provenance.
 
 ## Architecture
 
@@ -218,6 +218,42 @@ unattended script.
 ```bash
 sudo ./scripts/test-lifecycle.sh
 sudo ./scripts/test-lifecycle.sh --image /path/to/base.qcow2
+```
+
+## Network namespaces (real per-VM network isolation)
+
+`"network": {"mode": "tap", "netns": true}` gives a VM its own network namespace instead of putting
+its tap directly on a shared host bridge — a separate routing table, iptables, and interface list, not
+just a shared L2 segment. `bridge` is ignored in this mode (there's no shared bridge to join). Built
+from a veth pair NATed to the host, plus a small internal bridge inside the namespace joining the
+veth's namespace end to the VM's own tap:
+
+```text
+  host default netns                    │  VM's own netns
+  <vethh> 169.254.X.1/30 ──veth pair──►  <vethn> ── <br> ── <tap> ── guest
+  iptables MASQUERADE                    │  default route via 169.254.X.1
+```
+
+The VMM process itself is launched inside the namespace (`ip netns exec`) — it has to be, to even see
+the tap device, which lives in a different network namespace than the VMM would otherwise be in. This
+composes with the Firecracker jailer (`ip netns exec <ns> -- jailer ... -- firecracker ...`): network
+namespace and mount/chroot isolation are independent kernel mechanisms and stack cleanly.
+
+```json
+{"name": "isolated-vm", "backend": "qemu", "image": "...", "network": {"mode": "tap", "netns": true}}
+```
+
+Verified on real hardware (`scripts/test-network-namespace.sh`, 10/10): the namespace/veth/bridge/tap
+really exist (read directly from `ip netns exec ... ip link show`); the VMM process is confirmed to
+really be running inside that namespace by comparing `/proc/<pid>/ns/net` against the namespace's own
+inode (the only way to actually prove two things share a network namespace); a real ping across the
+veth pair from inside the namespace proves the NAT path genuinely works end to end, not just that the
+interfaces exist; deleting the VM tears down the whole namespace with no leftover host-side veth
+interfaces (deleting a netns cascades to every interface inside it, including — since a veth is one
+kernel object with two ends — the host-side peer).
+
+```bash
+sudo ./scripts/test-network-namespace.sh --image /path/to/base.qcow2
 ```
 
 ## Create a QEMU disposable VM
@@ -711,7 +747,7 @@ assigned the same vsock CID.
 ## Production changes I would make next
 
 1. **Firecracker jailer's own `--cgroup`/`--resource-limit` flags** — not wired up, but superseded in practice: every VM (all three backends, not just jailed Firecracker) already gets real cgroup v2 resource control (CPU/memory/IO/pids/cpuset, freeze/thaw, stats, PSI pressure) independent of the jailer — see "Resource control (cgroup v2)" above.
-2. **Network namespaces** — one namespace per VM, veth/TAP, nftables, DHCP/IPAM.
+2. **Network namespace policy** — one namespace per VM (veth + NAT + internal bridge) is already implemented and opt-in per VM (see "Network namespaces" above); still missing: nftables instead of one flat iptables MASQUERADE rule per VM, and real IPAM (subnets are derived deterministically from the VM id rather than tracked/reused, a documented theoretical-collision tradeoff).
 3. **Snapshots** — full VM state + disk snapshots per backend, for restoring a specific VM's exact prior state (as opposed to warm pools, already implemented, which speed up starting a *fresh* VM from a template — see "Warm VM pools" above).
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
 5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.

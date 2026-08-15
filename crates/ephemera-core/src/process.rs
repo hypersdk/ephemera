@@ -43,6 +43,24 @@ pub async fn output_checked(program: &str, args: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// When `netns` is `Some`, rewrites `(program, args)` into `("ip", ["netns",
+/// "exec", netns, program, ...args])` so the eventual `spawn_logged` call
+/// launches the VMM (or, for a jailed Firecracker VM, `jailer` — `ip netns
+/// exec` + `setns()` + `exec()` compose fine, the whole process tree stays
+/// in the namespace across jailer's own exec into Firecracker) inside that
+/// network namespace instead of the host's default one. A no-op passthrough
+/// when `netns` is `None`, so every backend can call this unconditionally.
+pub fn netns_wrap(netns: Option<&str>, program: &str, args: &[String]) -> (String, Vec<String>) {
+    match netns {
+        Some(ns) => {
+            let mut wrapped = vec!["netns".to_string(), "exec".to_string(), ns.to_string(), program.to_string()];
+            wrapped.extend(args.iter().cloned());
+            ("ip".to_string(), wrapped)
+        }
+        None => (program.to_string(), args.to_vec()),
+    }
+}
+
 pub async fn spawn_logged(program: &str, args: &[String], log: &Path) -> Result<Child> {
     let stdout = OpenOptions::new().create(true).append(true).open(log)?;
     let stderr = stdout.try_clone()?;
@@ -115,4 +133,26 @@ pub async fn process_alive(pid: u32) -> bool {
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netns_wrap_passes_through_unchanged_when_no_namespace() {
+        let (program, args) = netns_wrap(None, "qemu-system-x86_64", &["-m".into(), "512".into()]);
+        assert_eq!(program, "qemu-system-x86_64");
+        assert_eq!(args, vec!["-m".to_string(), "512".to_string()]);
+    }
+
+    #[test]
+    fn netns_wrap_prefixes_ip_netns_exec_when_namespaced() {
+        let (program, args) = netns_wrap(Some("eph-abcd1234"), "qemu-system-x86_64", &["-m".into(), "512".into()]);
+        assert_eq!(program, "ip");
+        assert_eq!(
+            args,
+            vec!["netns", "exec", "eph-abcd1234", "qemu-system-x86_64", "-m", "512"]
+        );
+    }
 }

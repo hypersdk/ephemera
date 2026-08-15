@@ -274,6 +274,7 @@ impl VmManager {
             jail_path: None,
             vsock_socket: None,
             cgroup_path: None,
+            netns: None,
         };
         // Deciding the CID and reserving it happen as one atomic, locked
         // operation in the store — see ephemera-storage::Store::insert_with_cid
@@ -294,6 +295,7 @@ impl VmManager {
             };
             let network = ephemera_network::prepare(&self.cfg, id, &req.network).await?;
             record.tap_name = network.tap_name.clone();
+            record.netns = network.netns.clone();
             record.seed_disk = seed.clone();
 
             // QEMU talks straight to the guest_cid over a real kernel vsock
@@ -326,7 +328,7 @@ impl VmManager {
         }.await;
 
         if let Err(e) = result {
-            if let Some(tap) = &record.tap_name { let _ = ephemera_network::cleanup(&req.network, tap).await; }
+            if let Some(tap) = &record.tap_name { let _ = ephemera_network::cleanup(id, &req.network, tap, record.netns.as_deref()).await; }
             record.status = VmStatus::Failed;
             record.error = Some(format!("{e:#}"));
             self.store.update(record.clone()).await?;
@@ -362,6 +364,7 @@ impl VmManager {
         let result: Result<()> = async {
             let network = ephemera_network::prepare(&self.cfg, id, &vm.request.network).await?;
             vm.tap_name = network.tap_name.clone();
+            vm.netns = network.netns.clone();
 
             let vsock_socket = match (vm.guest_cid, vm.backend) {
                 (Some(_), BackendKind::Qemu) => None,
@@ -393,7 +396,7 @@ impl VmManager {
 
         if let Err(e) = result {
             if let Some(tap) = &vm.tap_name {
-                let _ = ephemera_network::cleanup(&vm.request.network, tap).await;
+                let _ = ephemera_network::cleanup(id, &vm.request.network, tap, vm.netns.as_deref()).await;
             }
             vm.status = VmStatus::Failed;
             vm.error = Some(format!("{e:#}"));
@@ -421,7 +424,8 @@ impl VmManager {
                 }
             }
         }
-        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
+        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(id, &vm.request.network, tap, vm.netns.as_deref()).await; }
+        vm.netns = None;
         // cgroup v2 requires a cgroup to be empty (no PIDs left in
         // cgroup.procs) before rmdir succeeds — safe here since the process
         // is confirmed dead by this point either way (graceful exit,
@@ -505,7 +509,8 @@ impl VmManager {
                         let mut vm = vm;
                         vm.status = VmStatus::Stopped;
                         vm.pid = None;
-                        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
+                        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(vm.id, &vm.request.network, tap, vm.netns.as_deref()).await; }
+                        vm.netns = None;
                         if let Some(cgroup_path) = vm.cgroup_path.take() {
                             if let Ok(mgr) = ephemera_cgroup::CgroupManager::from_path(cgroup_path) {
                                 let _ = mgr.remove();

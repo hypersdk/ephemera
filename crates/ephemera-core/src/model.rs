@@ -34,6 +34,17 @@ pub enum NetworkSpec {
         bridge: Option<String>,
         #[serde(default)]
         mac: Option<String>,
+        /// Give this VM its own network namespace (veth pair + NAT to the
+        /// host, an internal bridge joining the veth and the tap inside the
+        /// namespace) instead of putting its tap directly on the shared
+        /// host bridge named by `bridge` (which is ignored when this is
+        /// true). Real isolation: the VM's own routing table, iptables, and
+        /// interface list are separate from the host's and from every other
+        /// namespaced VM's — not just a shared L2 segment. The VMM process
+        /// itself is launched inside the namespace (`ip netns exec`) so it
+        /// can see the tap at all.
+        #[serde(default)]
+        netns: bool,
     },
     /// A macvtap device on `parent`, giving the VM its own MAC directly on
     /// that link with no host bridge involved. Supported by the QEMU and
@@ -174,6 +185,11 @@ pub struct VmRecord {
     /// `None` until the first successful launch completes cgroup setup.
     #[serde(default)]
     pub cgroup_path: Option<PathBuf>,
+    /// Name of this VM's private network namespace, when
+    /// `NetworkSpec::Tap { netns: true, .. }` — see
+    /// `ephemera_network::netns`. `None` for every other networking mode.
+    #[serde(default)]
+    pub netns: Option<String>,
 }
 
 /// A named template for a warm pool: `size` VMs matching `template` are

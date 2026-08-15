@@ -6,9 +6,12 @@ use async_trait::async_trait;
 use ephemera_core::{
     backend::{path_arg, LaunchContext, LaunchResult, VmBackend},
     config::Config,
-    model::{BackendKind, CreateVmRequest, NetworkSpec},
-    process::spawn_logged,
+    model::{BackendKind, CreateVmRequest, NetworkSpec, VmRecord},
+    process::{run_checked_timeout, spawn_logged},
 };
+use std::time::Duration;
+
+const CH_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct CloudHypervisorBackend;
 
@@ -43,6 +46,12 @@ pub fn build_args(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> R
         NetworkSpec::User { .. } => bail!("Cloud Hypervisor backend requires network.mode=none, tap, or macvtap in this MVP"),
     }
 
+    if req.agent.as_ref().is_some_and(|ag| ag.enabled) {
+        let cid = ctx.guest_cid.context("agent enabled but no vsock CID was assigned")?;
+        let socket = ctx.vsock_socket.as_ref().context("agent enabled but no vsock socket path was assigned")?;
+        a.extend(["--vsock".into(), format!("cid={cid},socket={}", path_arg(socket))]);
+    }
+
     if let Some(kernel) = &req.kernel {
         a.extend(["--kernel".into(), path_arg(kernel)]);
         if let Some(initrd) = &req.initrd { a.extend(["--initramfs".into(), path_arg(initrd)]); }
@@ -71,4 +80,26 @@ impl VmBackend for CloudHypervisorBackend {
         let pid = child.id().context("Cloud Hypervisor exited before PID was available")?;
         Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("ch-api.sock")) })
     }
+
+    async fn pause(&self, cfg: &Config, vm: &VmRecord) -> Result<()> {
+        ch_remote(cfg, vm, "pause").await
+    }
+
+    async fn resume(&self, cfg: &Config, vm: &VmRecord) -> Result<()> {
+        ch_remote(cfg, vm, "resume").await
+    }
+
+    async fn graceful_shutdown(&self, cfg: &Config, vm: &VmRecord) -> Result<()> {
+        ch_remote(cfg, vm, "shutdown").await
+    }
+}
+
+async fn ch_remote(cfg: &Config, vm: &VmRecord, subcommand: &str) -> Result<()> {
+    let api = vm.workspace.join("ch-api.sock");
+    run_checked_timeout(
+        &cfg.ch_remote_binary,
+        &["--api-socket".into(), api.display().to_string(), subcommand.into()],
+        CH_REMOTE_TIMEOUT,
+    )
+    .await
 }

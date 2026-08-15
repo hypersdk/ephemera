@@ -28,6 +28,16 @@ enum Command {
     List,
     Get { id: Uuid },
     Stop { id: Uuid },
+    Pause { id: Uuid },
+    Resume { id: Uuid },
+    /// Run a command inside the guest over vsock (requires agent.enabled in the VM spec).
+    Exec {
+        id: Uuid,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     Delete { id: Uuid },
     BuildImage { #[arg(long)] spec: PathBuf },
 }
@@ -57,6 +67,12 @@ async fn main() -> Result<()> {
         Command::List => println!("{}", serde_json::to_string_pretty(&m.list().await)?),
         Command::Get { id } => println!("{}", serde_json::to_string_pretty(&m.get(id).await?)?),
         Command::Stop { id } => println!("{}", serde_json::to_string_pretty(&m.stop(id).await?)?),
+        Command::Pause { id } => println!("{}", serde_json::to_string_pretty(&m.pause(id).await?)?),
+        Command::Resume { id } => println!("{}", serde_json::to_string_pretty(&m.resume(id).await?)?),
+        Command::Exec { id, timeout_seconds, command } => {
+            let response = m.exec(id, command.join(" "), timeout_seconds).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
         Command::Delete { id } => m.delete(id).await?,
         Command::BuildImage { spec } => {
             let req: BuildImageRequest = serde_json::from_slice(&std::fs::read(spec)?)?;

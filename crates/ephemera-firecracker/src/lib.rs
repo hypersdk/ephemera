@@ -1,16 +1,20 @@
 // Copyright 2026 Zyvor
 // SPDX-License-Identifier: Apache-2.0
 
+mod http;
+
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ephemera_core::{
     backend::{path_arg, LaunchContext, LaunchResult, VmBackend},
     config::Config,
-    model::{BackendKind, CreateVmRequest, NetworkSpec},
+    model::{BackendKind, CreateVmRequest, NetworkSpec, VmRecord},
     process::spawn_logged,
 };
 use serde_json::json;
-use std::fs;
+use std::{fs, time::Duration};
+
+const API_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct FirecrackerBackend;
 
@@ -67,6 +71,16 @@ fn config_json(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Resu
         ),
         NetworkSpec::User { .. } => bail!("Firecracker backend requires network.mode=none or tap"),
     }
+
+    if req.agent.as_ref().is_some_and(|a| a.enabled) {
+        let cid = ctx.guest_cid.context("agent enabled but no vsock CID was assigned")?;
+        let socket = ctx.vsock_socket.as_ref().context("agent enabled but no vsock socket path was assigned")?;
+        root.as_object_mut().unwrap().insert(
+            "vsock".into(),
+            json!({"guest_cid": cid, "uds_path": path_arg(socket)}),
+        );
+    }
+
     Ok(root)
 }
 
@@ -86,4 +100,36 @@ impl VmBackend for FirecrackerBackend {
         let pid = child.id().context("Firecracker exited before PID was available")?;
         Ok(LaunchResult { pid, control_socket: Some(api) })
     }
+
+    async fn pause(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
+        set_vm_state(vm, "Paused").await
+    }
+
+    async fn resume(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
+        set_vm_state(vm, "Resumed").await
+    }
+
+    async fn graceful_shutdown(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
+        // x86_64-only action; Firecracker has no ARM equivalent in its
+        // public API today. This project targets x86_64 hosts only.
+        http::request(
+            &vm.workspace.join("firecracker.sock"),
+            "PUT",
+            "/actions",
+            Some(&json!({"action_type": "SendCtrlAltDel"})),
+            API_TIMEOUT,
+        )
+        .await
+    }
+}
+
+async fn set_vm_state(vm: &VmRecord, state: &str) -> Result<()> {
+    http::request(
+        &vm.workspace.join("firecracker.sock"),
+        "PATCH",
+        "/vm",
+        Some(&json!({"state": state})),
+        API_TIMEOUT,
+    )
+    .await
 }

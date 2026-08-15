@@ -57,6 +57,21 @@ pub struct PortForward {
 }
 fn default_tcp() -> String { "tcp".into() }
 
+/// Enables the in-guest vsock agent (ping/exec/shutdown, no SSH needed).
+/// `port` is the AF_VSOCK port the guest listens on, not a host TCP port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_agent_port")]
+    pub port: u32,
+}
+fn default_agent_port() -> u32 { 17777 }
+
+impl Default for AgentSpec {
+    fn default() -> Self { Self { enabled: false, port: default_agent_port() } }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CloudInitSpec {
     #[serde(default)]
@@ -98,6 +113,8 @@ pub struct CreateVmRequest {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub agent: Option<AgentSpec>,
 }
 fn default_vcpus() -> u8 { 2 }
 fn default_memory() -> u64 { 2048 }
@@ -107,6 +124,7 @@ fn default_memory() -> u64 { 2048 }
 pub enum VmStatus {
     Creating,
     Running,
+    Paused,
     Stopped,
     Failed,
 }
@@ -128,4 +146,7 @@ pub struct VmRecord {
     pub log_path: PathBuf,
     pub error: Option<String>,
     pub request: CreateVmRequest,
+    /// Host-unique AF_VSOCK CID assigned when `request.agent` is enabled.
+    #[serde(default)]
+    pub guest_cid: Option<u32>,
 }

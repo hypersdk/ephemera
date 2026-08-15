@@ -215,6 +215,11 @@ JSON
 fi
 
 section "Test 3: macvtap"
+# This mode has no DHCP server on the segment (macvtap bridge mode can't
+# reach the parent/host, and there's nothing else listening), so the guest's
+# systemd-networkd-wait-online.service sits waiting on its own ~120s default
+# timeout before boot can continue far enough for our static-IP runcmd to
+# run — budget wait_ssh accordingly below, well past that.
 OWN_DUMMY=false
 if [ -z "$MACVTAP_PARENT" ]; then
     MACVTAP_PARENT="ephdummy0"
@@ -276,7 +281,7 @@ ID=$(echo "$OUT" | json_field id)
 TAP=$(echo "$OUT" | json_field tap_name)
 PID=$(echo "$OUT" | json_field pid)
 
-if wait_ssh "$GUEST_IP" 22 30; then
+if wait_ssh "$GUEST_IP" 22 45; then
     pass "macvtap: SSH reachable at ${GUEST_IP}:22 (via sibling ${TESTER} on ${MACVTAP_PARENT})"
 else
     fail "macvtap: SSH never became reachable at ${GUEST_IP}:22"

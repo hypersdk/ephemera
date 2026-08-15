@@ -29,8 +29,27 @@ pub struct BuildImageRequest {
     pub commands: Vec<String>,
     #[serde(default)]
     pub ssh_key: Option<String>,
+    /// Files to place directly into the image before any virt-customize
+    /// step runs (e.g. a compiled `ephemera-guest-agent` binary and its
+    /// systemd unit). Applied via `guestkit` — a host-side file's
+    /// permission bits are preserved on copy, so a binary already marked
+    /// executable stays executable; no separate chmod step is needed.
+    #[serde(default)]
+    pub copy_in: Vec<CopyIn>,
+    /// systemd unit names to `systemctl enable` via guestkit's chroot
+    /// command exec, in the same session as `copy_in` — independent of
+    /// virt-customize, whose libguestfs appliance needs outbound networking
+    /// (via `passt`) that isn't available/working on every host.
+    #[serde(default)]
+    pub enable_services: Vec<String>,
 }
 fn default_format() -> String { "qcow2".into() }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyIn {
+    pub src: PathBuf,
+    pub dest: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BuildImageResult {
@@ -75,6 +94,10 @@ pub async fn build_image(cfg: &Config, req: &BuildImageRequest) -> Result<BuildI
         ]).await?;
     }
 
+    if !req.copy_in.is_empty() || !req.enable_services.is_empty() {
+        inject_files(&req.output, req.copy_in.clone(), req.enable_services.clone()).await?;
+    }
+
     if req.hostname.is_some() || !req.packages.is_empty() || !req.commands.is_empty() || req.ssh_key.is_some() {
         let mut a = vec!["-a".into(), req.output.display().to_string()];
         if let Some(h) = &req.hostname { a.extend(["--hostname".into(), h.clone()]); }
@@ -92,6 +115,49 @@ pub async fn build_image(cfg: &Config, req: &BuildImageRequest) -> Result<BuildI
         }
     }
     Ok(BuildImageResult { output: req.output.clone(), format: req.format.clone() })
+}
+
+/// Copies `files` into `image` and `systemctl enable`s `services`, via
+/// `guestkit` (qemu-nbd mount + chroot — no libguestfs appliance, so this
+/// works even where `virt-customize`'s network-capable appliance doesn't;
+/// see the doc comment on `enable_services`). `Guestfs`'s methods are
+/// synchronous/blocking, so this runs on a blocking-pool thread rather than
+/// stalling the async runtime for however long the mount+copy takes.
+async fn inject_files(image: &Path, files: Vec<CopyIn>, services: Vec<String>) -> Result<()> {
+    let image = image.to_path_buf();
+    tokio::task::spawn_blocking(move || inject_files_blocking(&image, &files, &services))
+        .await
+        .context("guestkit worker thread panicked")?
+}
+
+fn inject_files_blocking(image: &Path, files: &[CopyIn], services: &[String]) -> Result<()> {
+    use guestkit::Guestfs;
+
+    let mut g = Guestfs::new().context("creating guestfs handle")?;
+    g.add_drive(image).with_context(|| format!("adding drive {}", image.display()))?;
+    g.launch().context("launching guestfs")?;
+
+    let roots = g.inspect_os().context("inspecting guest OS")?;
+    let root = roots.first().context("no operating system found in image")?;
+    let mounts = g.inspect_get_mountpoints(root).context("getting mountpoints")?;
+    for (mountpoint, device) in &mounts {
+        g.mount(device, mountpoint)
+            .with_context(|| format!("mounting {device} at {mountpoint}"))?;
+    }
+
+    for file in files {
+        let src = file.src.to_str().context("copy_in src path is not valid UTF-8")?;
+        g.upload(src, &file.dest)
+            .with_context(|| format!("copying {} to {} in image", file.src.display(), file.dest))?;
+    }
+    for service in services {
+        g.command(&["systemctl", "enable", service])
+            .with_context(|| format!("enabling {service}"))?;
+    }
+
+    let _ = g.umount_all();
+    g.shutdown().context("shutting down guestfs")?;
+    Ok(())
 }
 
 async fn image_format(cfg: &Config, image: &Path) -> String {

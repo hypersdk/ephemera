@@ -63,17 +63,23 @@ fi
 [ -n "$VERSION" ] || fail "could not resolve a cloud-hypervisor version"
 info "Target version: ${VERSION}"
 
+SKIP_CH_BINARY=false
 if command -v cloud-hypervisor >/dev/null 2>&1; then
     CURRENT="$(cloud-hypervisor --version 2>/dev/null | awk '{print $2}')"
     if [ "$CURRENT" = "${VERSION#v}" ] || [ "v${CURRENT}" = "$VERSION" ]; then
         ok "cloud-hypervisor ${CURRENT} already installed"
-        [ "$WITH_FIRMWARE" != true ] && exit 0
+        SKIP_CH_BINARY=true
     fi
 fi
 
 ASSET="cloud-hypervisor-static${ARCH}"
 RELEASE_JSON="$(api "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}")"
-DOWNLOAD_URL="$(echo "$RELEASE_JSON" | python3 -c "
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+if [ "$SKIP_CH_BINARY" != true ]; then
+    DOWNLOAD_URL="$(echo "$RELEASE_JSON" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 for a in d.get('assets', []):
@@ -81,7 +87,7 @@ for a in d.get('assets', []):
         print(a['browser_download_url'])
         break
 ")"
-DIGEST="$(echo "$RELEASE_JSON" | python3 -c "
+    DIGEST="$(echo "$RELEASE_JSON" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 for a in d.get('assets', []):
@@ -89,24 +95,63 @@ for a in d.get('assets', []):
         print((a.get('digest') or '').removeprefix('sha256:'))
         break
 ")"
-[ -n "$DOWNLOAD_URL" ] || fail "asset ${ASSET} not found in release ${VERSION}"
+    [ -n "$DOWNLOAD_URL" ] || fail "asset ${ASSET} not found in release ${VERSION}"
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-info "Downloading ${ASSET} (${VERSION})..."
-curl -fsSL -o "${TMP}/cloud-hypervisor" "$DOWNLOAD_URL"
+    info "Downloading ${ASSET} (${VERSION})..."
+    curl -fsSL -o "${TMP}/cloud-hypervisor" "$DOWNLOAD_URL"
 
-if [ -n "$DIGEST" ]; then
-    GOT="$(${SHA_CMD} "${TMP}/cloud-hypervisor" | awk '{print $1}')"
-    [ "$GOT" = "$DIGEST" ] || fail "checksum mismatch for ${ASSET}: expected ${DIGEST}, got ${GOT}"
-    ok "checksum verified"
-else
-    echo "  [WARN] GitHub did not report a digest for ${ASSET}; installing unverified" >&2
+    if [ -n "$DIGEST" ]; then
+        GOT="$(${SHA_CMD} "${TMP}/cloud-hypervisor" | awk '{print $1}')"
+        [ "$GOT" = "$DIGEST" ] || fail "checksum mismatch for ${ASSET}: expected ${DIGEST}, got ${GOT}"
+        ok "checksum verified"
+    else
+        echo "  [WARN] GitHub did not report a digest for ${ASSET}; installing unverified" >&2
+    fi
+
+    chmod +x "${TMP}/cloud-hypervisor"
+    $SUDO install -m755 "${TMP}/cloud-hypervisor" "${INSTALL_DIR}/cloud-hypervisor"
+    ok "installed ${INSTALL_DIR}/cloud-hypervisor ($(${INSTALL_DIR}/cloud-hypervisor --version 2>/dev/null || echo "$VERSION"))"
 fi
 
-chmod +x "${TMP}/cloud-hypervisor"
-$SUDO install -m755 "${TMP}/cloud-hypervisor" "${INSTALL_DIR}/cloud-hypervisor"
-ok "installed ${INSTALL_DIR}/cloud-hypervisor ($(${INSTALL_DIR}/cloud-hypervisor --version 2>/dev/null || echo "$VERSION"))"
+# ch-remote is a separate asset in the same release — needed for
+# pause/resume/shutdown (ephemera shells out to it rather than talking to
+# the API socket directly).
+if command -v ch-remote >/dev/null 2>&1; then
+    ok "ch-remote already installed"
+else
+    CH_REMOTE_ASSET="ch-remote-static${ARCH}"
+    CH_REMOTE_URL="$(echo "$RELEASE_JSON" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for a in d.get('assets', []):
+    if a['name'] == '${CH_REMOTE_ASSET}':
+        print(a['browser_download_url'])
+        break
+")"
+    CH_REMOTE_DIGEST="$(echo "$RELEASE_JSON" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for a in d.get('assets', []):
+    if a['name'] == '${CH_REMOTE_ASSET}':
+        print((a.get('digest') or '').removeprefix('sha256:'))
+        break
+")"
+    if [ -n "$CH_REMOTE_URL" ]; then
+        curl -fsSL -o "${TMP}/ch-remote" "$CH_REMOTE_URL"
+        if [ -n "$CH_REMOTE_DIGEST" ]; then
+            GOT="$(${SHA_CMD} "${TMP}/ch-remote" | awk '{print $1}')"
+            [ "$GOT" = "$CH_REMOTE_DIGEST" ] || fail "checksum mismatch for ${CH_REMOTE_ASSET}: expected ${CH_REMOTE_DIGEST}, got ${GOT}"
+            ok "ch-remote checksum verified"
+        else
+            echo "  [WARN] GitHub did not report a digest for ${CH_REMOTE_ASSET}; installing unverified" >&2
+        fi
+        chmod +x "${TMP}/ch-remote"
+        $SUDO install -m755 "${TMP}/ch-remote" "${INSTALL_DIR}/ch-remote"
+        ok "installed ${INSTALL_DIR}/ch-remote"
+    else
+        echo "  [WARN] could not find ${CH_REMOTE_ASSET} asset; pause/resume/shutdown will not work" >&2
+    fi
+fi
 
 if [ "$WITH_FIRMWARE" = true ]; then
     info "Resolving latest rust-hypervisor-firmware release..."

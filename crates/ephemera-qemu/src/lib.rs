@@ -1,14 +1,19 @@
 // Copyright 2026 Zyvor
 // SPDX-License-Identifier: Apache-2.0
 
+mod qmp;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ephemera_core::{
     backend::{path_arg, LaunchContext, LaunchResult, VmBackend},
     config::Config,
-    model::{BackendKind, CreateVmRequest, NetworkSpec},
+    model::{BackendKind, CreateVmRequest, NetworkSpec, VmRecord},
     process::spawn_logged,
 };
+use std::time::Duration;
+
+const QMP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct QemuBackend;
 
@@ -55,6 +60,12 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<Stri
         }
     }
 
+    if req.agent.as_ref().is_some_and(|a| a.enabled) {
+        if let Some(cid) = ctx.guest_cid {
+            a.extend(["-device".into(), format!("vhost-vsock-pci,guest-cid={cid}")]);
+        }
+    }
+
     if let Some(kernel) = &req.kernel {
         a.extend(["-kernel".into(), path_arg(kernel)]);
         if let Some(initrd) = &req.initrd { a.extend(["-initrd".into(), path_arg(initrd)]); }
@@ -82,5 +93,20 @@ impl VmBackend for QemuBackend {
         let child = spawned?;
         let pid = child.id().context("QEMU exited before PID was available")?;
         Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("qmp.sock")) })
+    }
+
+    async fn pause(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
+        qmp::execute(&vm.workspace.join("qmp.sock"), "stop", None, QMP_TIMEOUT).await?;
+        Ok(())
+    }
+
+    async fn resume(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
+        qmp::execute(&vm.workspace.join("qmp.sock"), "cont", None, QMP_TIMEOUT).await?;
+        Ok(())
+    }
+
+    async fn graceful_shutdown(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
+        qmp::execute(&vm.workspace.join("qmp.sock"), "system_powerdown", None, QMP_TIMEOUT).await?;
+        Ok(())
     }
 }

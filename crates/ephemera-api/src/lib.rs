@@ -11,6 +11,7 @@ use axum::{
 use ephemera_core::model::CreateVmRequest;
 use ephemera_image::{self as image, BuildImageRequest};
 use ephemera_scheduler::VmManager;
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -33,6 +34,9 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms", post(create_vm).get(list_vms))
         .route("/v1/vms/{id}", get(get_vm).delete(delete_vm))
         .route("/v1/vms/{id}/stop", post(stop_vm))
+        .route("/v1/vms/{id}/pause", post(pause_vm))
+        .route("/v1/vms/{id}/resume", post(resume_vm))
+        .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
         .layer(TraceLayer::new_for_http())
         .with_state(manager)
@@ -49,6 +53,27 @@ async fn get_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiRes
 }
 async fn stop_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!(m.stop(id).await?)))
+}
+async fn pause_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!(m.pause(id).await?)))
+}
+async fn resume_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!(m.resume(id).await?)))
+}
+
+#[derive(Deserialize)]
+struct ExecRequest {
+    command: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+async fn agent_exec(
+    State(m): State<Arc<VmManager>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ExecRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let response = m.exec(id, req.command, req.timeout_seconds).await?;
+    Ok(Json(json!(response)))
 }
 async fn delete_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
     m.delete(id).await?;

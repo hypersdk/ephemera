@@ -1,0 +1,18 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs INSIDE a guest image (baked in via ephemera build-image's copy_in),
+# not on the host. Distinct from ephemera.service (the host control plane).
+
+[Unit]
+Description=Zyvor Ephemera in-guest agent (vsock ping/exec/shutdown)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ephemera-guest-agent
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

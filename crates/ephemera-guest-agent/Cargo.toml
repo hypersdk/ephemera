@@ -1,0 +1,19 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ephemera-guest-agent"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "In-guest AF_VSOCK agent for Zyvor Ephemera (ping/exec/shutdown, no SSH needed)"
+
+[dependencies]
+ephemera-guest-protocol = { path = "../ephemera-guest-protocol" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+
+[[bin]]
+name = "ephemera-guest-agent"
+path = "src/main.rs"

@@ -258,13 +258,13 @@ REMOTE
 build_local_artifacts() {
     step_begin "Local build (release)"
     if [ "$DRY_RUN" = true ]; then
-        dry "would run: cargo build --release -p ephemera-cli"
+        dry "would run: cargo build --release -p ephemera-cli -p ephemera-guest-agent"
         return 0
     fi
     if [ "$(uname -s)" != "Linux" ]; then
         fail "--build-local requires a Linux build host (same arch as remote). Use full deploy without --build-local."
     fi
-    (cd "${PROJECT_DIR}" && cargo build --release -p ephemera-cli)
+    (cd "${PROJECT_DIR}" && cargo build --release -p ephemera-cli -p ephemera-guest-agent)
     [ -f "${PROJECT_DIR}/target/release/ephemera" ] || fail "target/release/ephemera missing"
     ok "Local binary ready"
     step_end
@@ -284,6 +284,21 @@ sync_files() {
     )
     _rsync "${excludes[@]}" "${PROJECT_DIR}/" "${TARGET_USER}@${TARGET_HOST}:${REMOTE_DIR}/"
     ok "Source synced to ${REMOTE_DIR}"
+
+    # ephemera-image depends on guestkit via a relative sibling path
+    # (../../../guestkit from crates/ephemera-image) — it has to land at the
+    # same relative depth next to REMOTE_DIR for that path dependency to
+    # resolve on the remote host.
+    local guestkit_local="${PROJECT_DIR}/../guestkit"
+    if [ -d "$guestkit_local" ]; then
+        local guestkit_remote
+        guestkit_remote="$(dirname "$REMOTE_DIR")/guestkit"
+        _ssh "mkdir -p '${guestkit_remote}'"
+        _rsync --exclude '.git' --exclude 'target' "${guestkit_local}/" "${TARGET_USER}@${TARGET_HOST}:${guestkit_remote}/"
+        ok "guestkit (sibling path dependency) synced to ${guestkit_remote}"
+    else
+        warn "no sibling guestkit checkout found at ${guestkit_local} — the build will fail if ephemera-image needs it"
+    fi
 }
 
 sync_binary_only() {
@@ -363,7 +378,7 @@ SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 source "$HOME/.cargo/env" 2>/dev/null || true
 cd "${REMOTE_STAGING}"
-cargo build --release -p ephemera-cli 2>&1 | tail -8
+cargo build --release -p ephemera-cli -p ephemera-guest-agent 2>&1 | tail -8
 $SUDO install -m755 target/release/ephemera /usr/local/bin/ephemera
 [ -f /etc/ephemera.toml ] || $SUDO install -m644 config.example.toml /etc/ephemera.toml
 $SUDO install -m644 systemd/ephemera.service /etc/systemd/system/ephemera.service

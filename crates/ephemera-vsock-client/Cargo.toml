@@ -2,16 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "ephemera-storage"
+name = "ephemera-vsock-client"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "VM-record state persistence for Zyvor Ephemera"
+description = "Host-side dialing for the Zyvor Ephemera guest agent over AF_VSOCK"
 
 [dependencies]
 ephemera-core = { path = "../ephemera-core" }
+ephemera-guest-protocol = { path = "../ephemera-guest-protocol" }
 anyhow = "1"
 libc = "0.2"
-serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["v4", "serde"] }

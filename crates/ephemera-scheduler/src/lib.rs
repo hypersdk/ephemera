@@ -9,9 +9,16 @@ use ephemera_core::{
     model::{BackendKind, CreateVmRequest, VmRecord, VmStatus},
     process,
 };
+use ephemera_guest_protocol::AgentRequest;
 use ephemera_storage::Store;
 use std::{fs, sync::Arc};
 use uuid::Uuid;
+
+/// Linux reserves vsock CIDs 0–2 (hypervisor/local/host); guest CIDs start
+/// at 3 and must be unique across the whole host.
+const FIRST_GUEST_CID: u32 = 3;
+
+const GRACEFUL_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn backend(kind: BackendKind) -> Box<dyn VmBackend> {
     match kind {
@@ -41,7 +48,9 @@ impl VmManager {
         let disk = workspace.join(if req.backend == BackendKind::Qemu { "root.qcow2" } else { "root.raw" });
         let log_path = workspace.join("console.log");
         let expires_at = req.ttl_seconds.map(|s| Utc::now() + Duration::seconds(s as i64));
-        let mut record = VmRecord {
+        let needs_cid = req.agent.as_ref().is_some_and(|a| a.enabled);
+
+        let placeholder = VmRecord {
             id,
             name: req.name.clone(),
             backend: req.backend,
@@ -57,8 +66,14 @@ impl VmManager {
             log_path: log_path.clone(),
             error: None,
             request: req.clone(),
+            guest_cid: None,
         };
-        self.store.insert(record.clone()).await?;
+        // Deciding the CID and reserving it happen as one atomic, locked
+        // operation in the store — see ephemera-storage::Store::insert_with_cid
+        // for why a separate "list, then insert" pair isn't safe across
+        // concurrent `ephemera` processes.
+        let mut record = self.store.insert_with_cid(placeholder, needs_cid, FIRST_GUEST_CID).await?;
+        let guest_cid = record.guest_cid;
 
         let result: Result<()> = async {
             ephemera_image::clone_for_vm(&self.cfg, &req.image, req.backend, &disk, req.disk_size_gib).await?;
@@ -70,6 +85,15 @@ impl VmManager {
             record.tap_name = network.tap_name.clone();
             record.seed_disk = seed.clone();
 
+            // QEMU talks straight to the guest_cid over a real kernel vsock
+            // device; Cloud Hypervisor/Firecracker instead proxy vsock over
+            // a UDS the VMM creates at launch, so only they need a path.
+            let vsock_socket = match (guest_cid, req.backend) {
+                (Some(_), BackendKind::Qemu) => None,
+                (Some(_), _) => Some(workspace.join("vsock.sock")),
+                (None, _) => None,
+            };
+
             let ctx = LaunchContext {
                 id,
                 workspace: workspace.clone(),
@@ -77,6 +101,8 @@ impl VmManager {
                 seed_disk: seed,
                 log_path: log_path.clone(),
                 network,
+                guest_cid,
+                vsock_socket,
             };
             let launch = backend(req.backend).launch(&self.cfg, &req, &ctx).await?;
             record.pid = Some(launch.pid);
@@ -106,7 +132,14 @@ impl VmManager {
         let mut vm = self.get(id).await?;
         if let Some(pid) = vm.pid {
             if process::process_alive(pid).await {
-                process::terminate_pid(pid).await?;
+                // Ask the VMM to shut the guest down cleanly first; only
+                // force-kill if it doesn't exit within the grace period (or
+                // the VMM's control channel didn't respond at all).
+                let asked_nicely = backend(vm.backend).graceful_shutdown(&self.cfg, &vm).await.is_ok();
+                let exited = asked_nicely && process::wait_for_exit(pid, (GRACEFUL_SHUTDOWN_WAIT.as_millis() / 100) as u32).await;
+                if !exited && process::process_alive(pid).await {
+                    process::terminate_pid(pid).await?;
+                }
             }
         }
         if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
@@ -114,6 +147,28 @@ impl VmManager {
         vm.pid = None;
         self.store.update(vm.clone()).await?;
         Ok(vm)
+    }
+
+    pub async fn pause(&self, id: Uuid) -> Result<VmRecord> {
+        let mut vm = self.get(id).await?;
+        backend(vm.backend).pause(&self.cfg, &vm).await?;
+        vm.status = VmStatus::Paused;
+        self.store.update(vm.clone()).await?;
+        Ok(vm)
+    }
+
+    pub async fn resume(&self, id: Uuid) -> Result<VmRecord> {
+        let mut vm = self.get(id).await?;
+        backend(vm.backend).resume(&self.cfg, &vm).await?;
+        vm.status = VmStatus::Running;
+        self.store.update(vm.clone()).await?;
+        Ok(vm)
+    }
+
+    pub async fn exec(&self, id: Uuid, command: String, timeout_seconds: Option<u64>) -> Result<ephemera_guest_protocol::AgentResponse> {
+        let vm = self.get(id).await?;
+        let wait = std::time::Duration::from_secs(timeout_seconds.unwrap_or(ephemera_guest_protocol::DEFAULT_EXEC_TIMEOUT_SECS) + 5);
+        ephemera_vsock_client::call(&vm, AgentRequest::Exec { command, timeout_seconds }, wait).await
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<()> {

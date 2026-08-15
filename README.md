@@ -50,6 +50,9 @@ crates/
 ├── ephemera-qemu                  QEMU/KVM backend
 ├── ephemera-cloud-hypervisor      Cloud Hypervisor backend
 ├── ephemera-firecracker           Firecracker backend
+├── ephemera-guest-protocol        wire types shared by the guest agent and its host client
+├── ephemera-guest-agent           in-guest AF_VSOCK agent binary (ping/exec/shutdown)
+├── ephemera-vsock-client          host-side vsock dialing (native for QEMU, UDS proxy for CH/Firecracker)
 ├── ephemera-scheduler             VmManager: VM lifecycle orchestration + TTL reaper
 ├── ephemera-api                   REST API (axum)
 ├── ephemera-cli                   `ephemera` CLI binary (composition root)
@@ -57,16 +60,25 @@ crates/
 └── ephemera-kube                  reserved: Kubernetes DisposableVM CRD/operator
 ```
 
-`ephemera-agent` and `ephemera-kube` are placeholder crates for the distributed,
-Kubernetes-native deployment described below under "Production changes I would
-make next" — they are workspace members but contain no functionality yet.
+`ephemera-agent` (a distinct concept from `ephemera-guest-agent` above — this one
+is the future per-*host* node-agent for multi-node deployments) and `ephemera-kube`
+are placeholder crates for the distributed, Kubernetes-native deployment described
+below under "Production changes I would make next" — they are workspace members
+but contain no functionality yet.
+
+This project also depends on the sibling [`guestkit`](../guestkit) project (a
+pure-Rust, qemu-nbd-based disk toolkit) as a path dependency from `ephemera-image`,
+for injecting files into an offline image without needing libguestfs/`virt-customize`
+for that step — see "Build an image" below.
 
 ## What is implemented
 
-- Common `VmBackend` Rust trait.
-- QEMU backend.
-- Cloud Hypervisor backend.
-- Firecracker backend using JSON `--config-file`.
+- Common `VmBackend` Rust trait: launch, pause, resume, graceful shutdown.
+- QEMU backend, pause/resume/shutdown via QMP.
+- Cloud Hypervisor backend, pause/resume/shutdown via `ch-remote`.
+- Firecracker backend using JSON `--config-file`, pause/resume via `PATCH /vm`, shutdown via `SendCtrlAltDel`.
+- Vsock guest agent (`ephemera exec <id> -- <command>`) — run a command inside the guest with no SSH and no network path at all; works over QEMU's native AF_VSOCK device and Cloud Hypervisor/Firecracker's UDS vsock proxy.
+- `stop` prefers a graceful VMM shutdown, falling back to force-kill only if the process doesn't exit within a grace period.
 - QEMU qcow2 backing overlays for cheap disposable writes.
 - Raw reflink copies for Firecracker / Cloud Hypervisor when the host filesystem supports reflinks.
 - Raw conversion fallback through `qemu-img`.
@@ -82,10 +94,11 @@ make next" — they are workspace members but contain no functionality yet.
 - Console log path per VM.
 - Control sockets: QMP, Cloud Hypervisor API socket, Firecracker API socket.
 - Image download/cache + SHA-256 verification.
-- `virt-customize` package/hostname/command/SSH-key customization.
-- systemd unit and one-command host bootstrap (installs QEMU tooling, Cloud Hypervisor, and Firecracker).
+- `virt-customize` package/hostname/command/SSH-key customization, plus `guestkit`-based `copy_in`/`enable_services` for injecting files (e.g. the guest agent binary) and enabling systemd units without needing a network-capable libguestfs appliance.
+- systemd units and one-command host bootstrap (installs QEMU tooling, Cloud Hypervisor, and Firecracker).
 - SSH/rsync remote deploy script with full and quick profiles.
-- End-to-end networking smoke test (QEMU user-mode NAT and TAP+bridge+DHCP, both SSH-verified).
+- End-to-end networking smoke test (QEMU user-mode NAT, TAP+bridge+DHCP, and macvtap, all SSH-verified).
+- End-to-end lifecycle smoke test (vsock exec, pause/resume, graceful shutdown, and vsock-CID uniqueness under concurrent creates, all verified against real VMs).
 
 ## Host requirements
 
@@ -191,6 +204,22 @@ sudo ./scripts/test-networking.sh --image /path/to/base.qcow2   # skip auto-down
 It downloads an Ubuntu 24.04 cloud image on first run (cached under `<state_dir>/images/`) unless
 `--image` is given, generates a throwaway SSH keypair, and prints a pass/fail/warn summary.
 
+`scripts/test-lifecycle.sh` covers the rest of the VM lifecycle the same way: boots a QEMU VM with
+the guest agent enabled and `network.mode=none`, proves `exec` round-trips real output over vsock
+(no network path exists at all), forces a CPU-bound loop into the guest so pausing has something to
+verify (an idle guest's VMM process shows ~flat CPU time whether it's paused or just idle — this
+avoids that false signal), confirms the VMM's own CPU-time counter actually freezes while paused,
+confirms `exec` works again after resume, confirms `stop` exits the VMM process, and confirms two
+concurrently-created VMs get distinct vsock CIDs. QEMU only — Cloud Hypervisor and Firecracker were
+validated manually (see "Pause, resume, and exec" below) since they need a Firecracker-compatible
+uncompressed `vmlinux` / extracted whole-disk rootfs respectively, more setup than belongs in an
+unattended script.
+
+```bash
+sudo ./scripts/test-lifecycle.sh
+sudo ./scripts/test-lifecycle.sh --image /path/to/base.qcow2
+```
+
 ## Create a QEMU disposable VM
 
 Edit `examples/qemu.json` to point at your base image and SSH public key.
@@ -226,6 +255,31 @@ sudo /usr/local/bin/ephemera --config /etc/ephemera.toml create \
 
 Firecracker does not use BIOS/UEFI in this flow. The request supplies the Linux kernel and the manager supplies a raw block rootfs.
 
+## Pause, resume, and exec
+
+```bash
+sudo /usr/local/bin/ephemera --config /etc/ephemera.toml pause <id>
+sudo /usr/local/bin/ephemera --config /etc/ephemera.toml resume <id>
+sudo /usr/local/bin/ephemera --config /etc/ephemera.toml exec <id> -- echo hello
+```
+
+`exec` requires `agent.enabled: true` in the VM spec (see the JSON contract below) and the guest
+image to have `ephemera-guest-agent` installed and running — build it with `cargo build --release
+-p ephemera-guest-agent` and bake it into an image via `build-image`'s `copy_in`/`enable_services`
+(see "Build an image" below, and `systemd/ephemera-guest-agent.service`).
+
+`stop` always tries a graceful VMM-level shutdown first (QMP `system_powerdown` for QEMU, `ch-remote
+shutdown` for Cloud Hypervisor, `SendCtrlAltDel` for Firecracker — x86_64 only, no ARM equivalent in
+Firecracker's API today) and only force-kills the process if it doesn't exit within a grace period.
+
+**Firecracker-specific note:** pause/resume were verified correct and fast against Firecracker's own
+authoritative `GET /` state (not CPU-time heuristics — an idle guest and a paused one both show flat
+CPU time, which is a false "it's paused" signal either way). `exec` over vsock works before a VM is
+ever paused, but did not survive a pause/resume cycle in testing on this Firecracker version — a
+Cloud Hypervisor VM's vsock connection *did* survive the identical pause/resume/exec sequence using
+the same client code, so this looks like a Firecracker vsock characteristic rather than an ephemera
+bug, but it's not something this project has a fix for.
+
 ## Build an image like a small virt-builder
 
 ```bash
@@ -247,6 +301,24 @@ Example request:
   "hostname": "zyvor-template",
   "packages": ["curl", "jq", "qemu-guest-agent"],
   "commands": ["systemctl enable qemu-guest-agent"]
+}
+```
+
+`copy_in` places files directly into the image (via `guestkit`, before `virt-customize` runs) and
+`enable_services` runs `systemctl enable` for each named unit — both independent of `virt-customize`'s
+appliance, which needs outbound networking (`passt`) that isn't guaranteed to work on every host.
+This is how the guest agent gets baked into an image:
+
+```json
+{
+  "source": "/var/lib/ephemera/images/ubuntu.qcow2",
+  "output": "/var/lib/ephemera/images/ubuntu-agent.qcow2",
+  "format": "qcow2",
+  "copy_in": [
+    {"src": "/path/to/target/release/ephemera-guest-agent", "dest": "/usr/local/bin/ephemera-guest-agent"},
+    {"src": "systemd/ephemera-guest-agent.service", "dest": "/etc/systemd/system/ephemera-guest-agent.service"}
+  ],
+  "enable_services": ["ephemera-guest-agent"]
 }
 ```
 
@@ -272,6 +344,9 @@ POST   /v1/vms
 GET    /v1/vms
 GET    /v1/vms/{uuid}
 POST   /v1/vms/{uuid}/stop
+POST   /v1/vms/{uuid}/pause
+POST   /v1/vms/{uuid}/resume
+POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
 ```
@@ -282,6 +357,14 @@ Create through REST:
 curl -sS http://127.0.0.1:7788/v1/vms \
   -H 'content-type: application/json' \
   --data-binary @examples/qemu.json | jq
+```
+
+Exec through REST (`agent.enabled: true` required, see below):
+
+```bash
+curl -sS http://127.0.0.1:7788/v1/vms/<uuid>/agent \
+  -H 'content-type: application/json' \
+  -d '{"command": "echo hello", "timeout_seconds": 30}' | jq
 ```
 
 ## VM JSON contract
@@ -307,10 +390,16 @@ curl -sS http://127.0.0.1:7788/v1/vms \
     "packages": ["curl"],
     "runcmd": ["echo hello > /tmp/hello"]
   },
+  "agent": {"enabled": true, "port": 17777},
   "ttl_seconds": 600,
   "extra_args": []
 }
 ```
+
+`agent.enabled` turns on the vsock guest agent (`ephemera exec`) for this VM — the guest image must
+have `ephemera-guest-agent` installed and enabled (see "Build an image" above). `agent.port` is the
+AF_VSOCK port the guest listens on (not a host TCP port); it defaults to `17777` and rarely needs
+changing, since each VM already gets its own host-unique vsock CID.
 
 ### Networking modes
 
@@ -365,6 +454,7 @@ its API only accepts a host device name it opens via `/dev/net/tun`, with no fd-
 ```text
 /var/lib/ephemera/
   vms.json
+  vms.lock
   downloads/
   images/
   kernels/
@@ -376,22 +466,28 @@ its API only accepts a host device name it opens via `/dev/net/tun`, with no fd-
       meta-data
       console.log
       qmp.sock | ch-api.sock | firecracker.sock
+      vsock.sock              (Cloud Hypervisor/Firecracker only, when agent.enabled)
       firecracker.json
 ```
+
+`vms.lock` coordinates `vms.json` reads/writes across concurrent `ephemera` processes (each CLI
+invocation is a separate process, not just a separate task inside `serve`) via an OS-level `flock` —
+without it, two VMs created at the same moment could silently lose one's record, or both get
+assigned the same vsock CID.
 
 ## Production changes I would make next
 
 1. **Firecracker jailer backend** — chroot, uid/gid isolation, cgroups, resource limits.
 2. **Network namespaces** — one namespace per VM, veth/TAP, nftables, DHCP/IPAM.
-3. **Vsock agent** — a small guest agent for readiness, command execution, file copy and clean shutdown.
-4. **Snapshot pools** — Firecracker snapshots and warm VM pools for sub-second job start.
-5. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
-6. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
-7. **Policy** — max vCPU/RAM/disk/TTL, allowed VMMs, allowed images, allowed networking.
-8. **Auth** — mTLS/OIDC, RBAC, tenant IDs and audit events.
-9. **Observability** — Prometheus metrics, tracing, per-VM boot timing and failure reasons.
-10. **Kubernetes CRD/operator** — `DisposableVM` CRD backed by node-local daemonsets (`ephemera-kube`).
-11. **Distributed node-agent** — `ephemera-agent` running per hypervisor host, reporting to a central `ephemera-scheduler`.
+3. **Snapshots** — full VM state + disk snapshots per backend, and warm VM pools (pre-created paused VMs) for sub-second job start.
+4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
+5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
+6. **Policy** — max vCPU/RAM/disk/TTL, allowed VMMs, allowed images, allowed networking.
+7. **Auth** — mTLS/OIDC, RBAC, tenant IDs and audit events, and an authenticated guest-agent protocol (today's vsock agent trusts any caller that can reach the VM's CID).
+8. **Observability** — Prometheus metrics, tracing, per-VM boot timing and failure reasons.
+9. **Kubernetes CRD/operator** — `DisposableVM` CRD backed by node-local daemonsets (`ephemera-kube`).
+10. **Distributed node-agent** — `ephemera-agent` (the per-*host* one, not `ephemera-guest-agent`) running per hypervisor host, reporting to a central `ephemera-scheduler`.
+11. **"auto" backend selection** — pick QEMU/Cloud Hypervisor/Firecracker automatically based on what the request needs, instead of requiring an explicit `backend`.
 12. **Scheduler placement** — NUMA awareness, CPU pinning, hugepages and GPU/VFIO assignment.
 13. **Windows path** — QEMU/Cloud Hypervisor only; UEFI, virtio-win injection, sysprep and unattend support.
 
@@ -405,6 +501,8 @@ its API only accepts a host device name it opens via `/dev/net/tun`, with no fd-
 - Guest disk partition/filesystem expansion after `qemu-img resize` is an image/guest concern. Use cloud-init growpart or your image pipeline.
 - `extra_args` is intentionally an administrator escape hatch. Do not expose it to untrusted tenants.
 - The API is localhost-only by default and has no authentication in this MVP.
+- The vsock guest agent has no authentication either — anything that can reach a VM's CID/port can run commands as root in the guest. Fine for a trusted single-tenant host; not fine to expose across a tenant boundary.
+- `guestkit`'s `inspect_os()` (used by `copy_in`) only recognizes partitioned disks and LVM volumes as OS roots by default; support for a bare, unpartitioned whole-disk filesystem (the shape Firecracker rootfs images are typically built in) was added as part of this project's testing and needs to make it into a real guestkit release — until then, building against a `guestkit` checkout without that fix will fail `copy_in` on such images with "no operating system found in image".
 
 ## License
 

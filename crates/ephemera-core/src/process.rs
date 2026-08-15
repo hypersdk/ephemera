@@ -22,6 +22,15 @@ pub async fn run_checked(program: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Like `run_checked`, but bounded — used for calls to a VMM's own control
+/// CLI (e.g. `ch-remote`), where a wedged VMM must not hang the caller
+/// forever.
+pub async fn run_checked_timeout(program: &str, args: &[String], timeout: std::time::Duration) -> Result<()> {
+    tokio::time::timeout(timeout, run_checked(program, args))
+        .await
+        .with_context(|| format!("{program} timed out after {timeout:?}"))?
+}
+
 pub async fn output_checked(program: &str, args: &[String]) -> Result<String> {
     let out = Command::new(program)
         .args(args)
@@ -50,7 +59,11 @@ pub async fn spawn_logged(program: &str, args: &[String], log: &Path) -> Result<
         .with_context(|| format!("spawning {program}"))
 }
 
-async fn wait_for_exit(pid: u32, attempts: u32) -> bool {
+/// Polls `process_alive` every 100ms, up to `attempts` times, returning
+/// `true` as soon as the process is gone (or `false` if it's still alive
+/// after the last attempt). Public so callers like a graceful-shutdown path
+/// can wait a bounded amount before falling back to a forceful stop.
+pub async fn wait_for_exit(pid: u32, attempts: u32) -> bool {
     for _ in 0..attempts {
         if !process_alive(pid).await {
             return true;

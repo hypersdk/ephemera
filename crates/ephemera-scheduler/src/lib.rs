@@ -86,7 +86,7 @@ impl VmManager {
         }.await;
 
         if let Err(e) = result {
-            if let Some(tap) = &record.tap_name { let _ = ephemera_network::cleanup_tap(tap).await; }
+            if let Some(tap) = &record.tap_name { let _ = ephemera_network::cleanup(&req.network, tap).await; }
             record.status = VmStatus::Failed;
             record.error = Some(format!("{e:#}"));
             self.store.update(record.clone()).await?;
@@ -109,7 +109,7 @@ impl VmManager {
                 process::terminate_pid(pid).await?;
             }
         }
-        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup_tap(tap).await; }
+        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
         vm.status = VmStatus::Stopped;
         vm.pid = None;
         self.store.update(vm.clone()).await?;
@@ -131,7 +131,7 @@ impl VmManager {
                     if !process::process_alive(pid).await {
                         vm.status = VmStatus::Stopped;
                         vm.pid = None;
-                        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup_tap(tap).await; }
+                        if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(&vm.request.network, tap).await; }
                         self.store.update(vm).await?;
                     }
                 }

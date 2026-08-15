@@ -60,6 +60,11 @@ fn config_json(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Resu
             }]));
         }
         NetworkSpec::Tap { tap_name: None, .. } => bail!("tap network was not prepared"),
+        NetworkSpec::Macvtap { .. } => bail!(
+            "Firecracker backend does not support macvtap: its API only accepts a host_dev_name \
+             it opens itself via /dev/net/tun, with no fd-passing option for a macvtap character \
+             device. Use network.mode=tap with a bridge, or mode=none."
+        ),
         NetworkSpec::User { .. } => bail!("Firecracker backend requires network.mode=none or tap"),
     }
     Ok(root)

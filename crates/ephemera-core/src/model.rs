@@ -30,6 +30,18 @@ pub enum NetworkSpec {
         #[serde(default)]
         mac: Option<String>,
     },
+    /// A macvtap device on `parent`, giving the VM its own MAC directly on
+    /// that link with no host bridge involved. Supported by the QEMU and
+    /// Cloud Hypervisor backends only (attached via a pre-opened file
+    /// descriptor); Firecracker has no fd-based tap attachment in its API.
+    Macvtap {
+        parent: String,
+        /// macvtap link mode: bridge (default) | vepa | private | passthru
+        #[serde(default)]
+        macvtap_mode: Option<String>,
+        #[serde(default)]
+        mac: Option<String>,
+    },
 }
 
 impl Default for NetworkSpec {

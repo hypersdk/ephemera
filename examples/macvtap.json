@@ -1,0 +1,22 @@
+{
+  "name": "qemu-macvtap",
+  "backend": "qemu",
+  "image": "/var/lib/ephemera/images/ubuntu.qcow2",
+  "vcpus": 2,
+  "memory_mib": 2048,
+  "disk_size_gib": 20,
+  "network": {
+    "mode": "macvtap",
+    "parent": "eth0",
+    "macvtap_mode": "bridge",
+    "mac": "52:54:00:aa:bb:cc"
+  },
+  "cloud_init": {
+    "hostname": "qemu-macvtap",
+    "user": "zyvor",
+    "ssh_authorized_keys": ["ssh-ed25519 REPLACE_ME"],
+    "packages": ["curl", "jq"],
+    "runcmd": ["echo ready > /tmp/ready"]
+  },
+  "ttl_seconds": 900
+}

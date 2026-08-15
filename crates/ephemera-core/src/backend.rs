@@ -9,7 +9,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct PreparedNetwork {
     pub spec: crate::model::NetworkSpec,
+    /// Name of the ephemeral network device to remove on stop (a TAP or a
+    /// macvtap link, depending on `spec`).
     pub tap_name: Option<String>,
+    /// For `NetworkSpec::Macvtap`: a pre-opened, exec-inheritable fd for the
+    /// device's `/dev/tapN` character device, passed to the VMM as `fd=`.
+    pub macvtap_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone)]

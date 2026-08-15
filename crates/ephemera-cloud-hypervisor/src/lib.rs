@@ -34,7 +34,13 @@ pub fn build_args(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> R
             a.extend(["--net".into(), n]);
         }
         NetworkSpec::Tap { tap_name: None, .. } => bail!("tap network was not prepared"),
-        NetworkSpec::User { .. } => bail!("Cloud Hypervisor backend requires network.mode=none or tap in this MVP"),
+        NetworkSpec::Macvtap { mac, .. } => {
+            let fd = ctx.network.macvtap_fd.context("macvtap network was not prepared")?;
+            let mut n = format!("fd={fd}");
+            if let Some(mac) = mac { n.push_str(&format!(",mac={mac}")); }
+            a.extend(["--net".into(), n]);
+        }
+        NetworkSpec::User { .. } => bail!("Cloud Hypervisor backend requires network.mode=none, tap, or macvtap in this MVP"),
     }
 
     if let Some(kernel) = &req.kernel {
@@ -57,7 +63,11 @@ impl VmBackend for CloudHypervisorBackend {
 
     async fn launch(&self, cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Result<LaunchResult> {
         let args = build_args(cfg, req, ctx)?;
-        let child = spawn_logged(&cfg.cloud_hypervisor_binary, &args, &ctx.log_path).await?;
+        let spawned = spawn_logged(&cfg.cloud_hypervisor_binary, &args, &ctx.log_path).await;
+        if let Some(fd) = ctx.network.macvtap_fd {
+            ephemera_core::process::close_fd(fd);
+        }
+        let child = spawned?;
         let pid = child.id().context("Cloud Hypervisor exited before PID was available")?;
         Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("ch-api.sock")) })
     }

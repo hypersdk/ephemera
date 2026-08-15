@@ -83,6 +83,14 @@ pub async fn terminate_pid(pid: u32) -> Result<()> {
     bail!("pid {pid} did not exit after SIGTERM/SIGKILL");
 }
 
+/// Closes a raw fd handed off to a VMM child (e.g. a macvtap device fd) once
+/// it has been inherited across exec; the parent no longer needs its copy.
+pub fn close_fd(fd: i32) {
+    unsafe {
+        libc::close(fd);
+    }
+}
+
 pub async fn process_alive(pid: u32) -> bool {
     // A dead pid is an expected, common result (e.g. while polling for exit
     // in terminate_pid), so capture output rather than let `kill`'s "No such

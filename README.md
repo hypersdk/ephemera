@@ -73,6 +73,7 @@ make next" — they are workspace members but contain no functionality yet.
 - Optional disk growth.
 - cloud-init NoCloud seed disk generation.
 - TAP interface creation and optional Linux bridge attachment.
+- macvtap networking (QEMU and Cloud Hypervisor) — a VM's own MAC directly on a parent link, no bridge.
 - QEMU user-mode networking + host port forwarding.
 - VM state persisted to JSON.
 - REST API.
@@ -171,14 +172,19 @@ actually reachable over SSH — not just that the process launched:
 - **TAP + Linux bridge + DHCP** (against an existing bridge with a DHCP server on it, e.g.
   libvirt's `virbr0` or a bridge set up by `bootstrap-host.sh`). Skipped with a warning if the
   bridge doesn't exist.
+- **macvtap**, against a throwaway `dummy0` parent by default so the test never touches a real
+  physical NIC/switch (pass `--macvtap-parent eth0` to test against a real uplink instead). Since
+  macvtap's `bridge` mode can't reach the parent/host directly, the test creates a second, host-side
+  macvtap sibling on the same parent to reach the guest's statically-assigned IP.
 
-Both cases also assert cleanup: the QEMU process and (for TAP) the tap interface must actually be
+All three also assert cleanup: the QEMU process and (for TAP/macvtap) the interface must actually be
 gone after `ephemera delete` — this is what caught a TAP-interface leak during development (fixed
 by making VM shutdown wait for the process to actually exit before releasing its network resources).
 
 ```bash
-sudo ./scripts/test-networking.sh                    # bridge defaults to vmbr0
-sudo ./scripts/test-networking.sh --bridge virbr0     # test against libvirt's default network
+sudo ./scripts/test-networking.sh                          # bridge defaults to vmbr0, macvtap uses dummy0
+sudo ./scripts/test-networking.sh --bridge virbr0           # test TAP against libvirt's default network
+sudo ./scripts/test-networking.sh --macvtap-parent eth0     # test macvtap against a real uplink
 sudo ./scripts/test-networking.sh --image /path/to/base.qcow2   # skip auto-downloading a test image
 ```
 
@@ -335,6 +341,25 @@ TAP/bridge (all VMMs):
 
 When `tap_name` is omitted, the manager creates one from the VM UUID.
 
+macvtap (QEMU and Cloud Hypervisor only — see below):
+
+```json
+{
+  "mode": "macvtap",
+  "parent": "eth0",
+  "macvtap_mode": "bridge",
+  "mac": "52:54:00:aa:bb:cc"
+}
+```
+
+Gives the VM its own MAC directly on `parent`'s link — no host bridge involved. `macvtap_mode` is
+the macvtap link mode: `bridge` (default — siblings on the same parent can reach each other, but
+not the parent itself directly), `vepa`, `private`, or `passthru`. The manager creates a per-VM
+macvtap device on `parent`, opens its `/dev/tapN` character device, and passes that file descriptor
+directly to the VMM (`-netdev tap,fd=N` for QEMU, `--net fd=N` for Cloud Hypervisor) — there's no
+persistent named tap the VMM opens itself, which is why **Firecracker doesn't support this mode**:
+its API only accepts a host device name it opens via `/dev/net/tun`, with no fd-passing option.
+
 ## State layout
 
 ```text
@@ -372,9 +397,10 @@ When `tap_name` is omitted, the manager creates one from the VM UUID.
 
 ## Important limitations in this MVP
 
-- QEMU user networking is supported; Cloud Hypervisor and Firecracker require TAP or no networking.
-- TAP setup requires host network privilege.
-- The bridge must already be configured for the network behavior you want.
+- QEMU user networking is supported; Cloud Hypervisor and Firecracker require TAP, macvtap (Cloud Hypervisor only), or no networking.
+- TAP and macvtap setup require host network privilege (CAP_NET_ADMIN).
+- The bridge (for TAP) or parent link (for macvtap) must already exist and be configured for the network behavior you want.
+- macvtap's `bridge` mode is asymmetric by design: sibling macvtap devices on the same parent can reach each other, but not the parent/host interface itself directly. Firecracker has no fd-passing option in its API, so macvtap isn't supported there.
 - Firecracker image preparation is stricter than QEMU because it boots a kernel/rootfs directly.
 - Guest disk partition/filesystem expansion after `qemu-img resize` is an image/guest concern. Use cloud-init growpart or your image pipeline.
 - `extra_args` is intentionally an administrator escape hatch. Do not expose it to untrusted tenants.

@@ -11,4 +11,5 @@ description = "TAP/bridge network preparation for Zyvor Ephemera"
 [dependencies]
 ephemera-core = { path = "../ephemera-core" }
 anyhow = "1"
+libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }

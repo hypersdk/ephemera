@@ -9,12 +9,18 @@
 # Test 2 — TAP attached to an existing Linux bridge with a DHCP server on it
 #           (e.g. libvirt's "default" network on virbr0). Skipped with a
 #           warning if the bridge doesn't exist.
+# Test 3 — macvtap. By default this creates a throwaway "dummy0" parent
+#           interface so the test is fully self-contained and never touches
+#           a real physical NIC/switch; pass --macvtap-parent to test against
+#           a real uplink instead. A static IP is used (macvtap's bridge mode
+#           can't reach the parent/host directly, so there's no DHCP server
+#           to rely on here) via a second, host-side macvtap sibling.
 #
-# Both tests also verify cleanup: the QEMU process and (for TAP) the tap
-# interface must be gone after `ephemera delete`.
+# All three also verify cleanup: the QEMU process and (for TAP/macvtap) the
+# tap/macvtap interface must be gone after `ephemera delete`.
 #
 # Usage:
-#   sudo ./scripts/test-networking.sh [--bridge NAME] [--image PATH] [--config PATH]
+#   sudo ./scripts/test-networking.sh [--bridge NAME] [--macvtap-parent NAME] [--image PATH] [--config PATH]
 #
 # Env:
 #   EPHEMERA_BIN   path to the ephemera binary (default: resolved from PATH or target/release)
@@ -24,6 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BRIDGE="vmbr0"
+MACVTAP_PARENT=""
 IMAGE=""
 CONFIG="/etc/ephemera.toml"
 [ -f "$CONFIG" ] || CONFIG=""
@@ -31,10 +38,11 @@ CONFIG="/etc/ephemera.toml"
 while [ $# -gt 0 ]; do
     case "$1" in
         --bridge) BRIDGE="$2"; shift 2 ;;
+        --macvtap-parent) MACVTAP_PARENT="$2"; shift 2 ;;
         --image)  IMAGE="$2"; shift 2 ;;
         --config) CONFIG="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
@@ -205,6 +213,91 @@ JSON
     }
     create_and_verify "TAP" "${TMP}/tap-net.json" 22 resolve_by_neigh
 fi
+
+section "Test 3: macvtap"
+OWN_DUMMY=false
+if [ -z "$MACVTAP_PARENT" ]; then
+    MACVTAP_PARENT="ephdummy0"
+    if ! ip link show "$MACVTAP_PARENT" >/dev/null 2>&1; then
+        ip link add name "$MACVTAP_PARENT" type dummy
+        OWN_DUMMY=true
+    fi
+    ip link set "$MACVTAP_PARENT" up
+fi
+
+TESTER="ephmvtest0"
+TESTER_IP="192.168.250.1"
+GUEST_IP="192.168.250.2"
+ip link add link "$MACVTAP_PARENT" name "$TESTER" type macvtap mode bridge
+ip addr add "${TESTER_IP}/24" dev "$TESTER"
+ip link set "$TESTER" up
+
+MAC=$(printf '52:54:00:%02x:%02x:%02x' $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
+
+# Written via json.dumps (not a bash heredoc): the runcmd shell snippet below
+# embeds its own quotes (awk's '$2!="lo"'), which is exactly the kind of
+# string that's fragile to hand-escape into JSON. The quoted heredoc
+# delimiter ('PYEOF') means bash does no expansion inside this script at
+# all — every value comes in through os.environ instead.
+cat > "${TMP}/gen_macvtap_spec.py" <<'PYEOF'
+import json, os
+
+static_cmd = (
+    "IFACE=$(ip -o link show | awk -F': ' '$2!=\"lo\"{print $2; exit}'); "
+    "ip addr add " + os.environ["GUEST_IP"] + "/24 dev $IFACE; ip link set $IFACE up"
+)
+spec = {
+    "name": "ephemera-nettest-macvtap",
+    "backend": "qemu",
+    "image": os.environ["IMAGE"],
+    "vcpus": 1,
+    "memory_mib": 768,
+    "network": {
+        "mode": "macvtap",
+        "parent": os.environ["MACVTAP_PARENT"],
+        "macvtap_mode": "bridge",
+        "mac": os.environ["MAC"],
+    },
+    "cloud_init": {
+        "hostname": "ephemera-nettest-macvtap",
+        "user": "eph",
+        "ssh_authorized_keys": [os.environ["PUBKEY"]],
+        "runcmd": [static_cmd],
+    },
+    "ttl_seconds": 300,
+}
+print(json.dumps(spec, indent=2))
+PYEOF
+IMAGE="$IMAGE" MACVTAP_PARENT="$MACVTAP_PARENT" MAC="$MAC" PUBKEY="$PUBKEY" GUEST_IP="$GUEST_IP" \
+    python3 "${TMP}/gen_macvtap_spec.py" > "${TMP}/macvtap-net.json"
+
+OUT=$(eph create --spec "${TMP}/macvtap-net.json")
+ID=$(echo "$OUT" | json_field id)
+TAP=$(echo "$OUT" | json_field tap_name)
+PID=$(echo "$OUT" | json_field pid)
+
+if wait_ssh "$GUEST_IP" 22 30; then
+    pass "macvtap: SSH reachable at ${GUEST_IP}:22 (via sibling ${TESTER} on ${MACVTAP_PARENT})"
+else
+    fail "macvtap: SSH never became reachable at ${GUEST_IP}:22"
+fi
+
+eph stop "$ID" >/dev/null
+eph delete "$ID"
+
+if kill -0 "$PID" 2>/dev/null; then
+    fail "macvtap: VMM process ${PID} still alive after delete"
+else
+    pass "macvtap: VMM process exited cleanly"
+fi
+if [ -n "$TAP" ] && ip link show "$TAP" >/dev/null 2>&1; then
+    fail "macvtap: interface ${TAP} leaked after delete"
+else
+    pass "macvtap: interface ${TAP} removed"
+fi
+
+ip link del "$TESTER" 2>/dev/null || true
+[ "$OWN_DUMMY" = true ] && ip link del "$MACVTAP_PARENT" 2>/dev/null || true
 
 section "Summary"
 echo "  pass: ${PASS}  fail: ${FAIL}  warn: ${WARN}"

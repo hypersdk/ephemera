@@ -12,7 +12,7 @@ use ephemera_core::{
 
 pub struct QemuBackend;
 
-pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Vec<String> {
+pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<String>> {
     let mut a = vec![
         "-enable-kvm".into(),
         "-machine".into(), "q35,accel=kvm".into(),
@@ -46,6 +46,13 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Vec<String> {
                 a.extend(["-device".into(), dev]);
             }
         }
+        NetworkSpec::Macvtap { mac, .. } => {
+            let fd = ctx.network.macvtap_fd.context("macvtap network was not prepared")?;
+            a.extend(["-netdev".into(), format!("tap,id=net0,fd={fd}")]);
+            let dev = mac.as_ref().map(|m| format!("virtio-net-pci,netdev=net0,mac={m}"))
+                .unwrap_or_else(|| "virtio-net-pci,netdev=net0".into());
+            a.extend(["-device".into(), dev]);
+        }
     }
 
     if let Some(kernel) = &req.kernel {
@@ -57,7 +64,7 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Vec<String> {
     let qmp = ctx.workspace.join("qmp.sock");
     a.extend(["-qmp".into(), format!("unix:{},server=on,wait=off", qmp.display())]);
     a.extend(req.extra_args.clone());
-    a
+    Ok(a)
 }
 
 #[async_trait]
@@ -65,8 +72,14 @@ impl VmBackend for QemuBackend {
     fn kind(&self) -> BackendKind { BackendKind::Qemu }
 
     async fn launch(&self, cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Result<LaunchResult> {
-        let args = build_args(req, ctx);
-        let child = spawn_logged(&cfg.qemu_binary, &args, &ctx.log_path).await?;
+        let args = build_args(req, ctx)?;
+        let spawned = spawn_logged(&cfg.qemu_binary, &args, &ctx.log_path).await;
+        // The child inherits the macvtap fd across exec (or spawn failed and
+        // there's nothing to inherit); either way the parent's copy is done.
+        if let Some(fd) = ctx.network.macvtap_fd {
+            ephemera_core::process::close_fd(fd);
+        }
+        let child = spawned?;
         let pid = child.id().context("QEMU exited before PID was available")?;
         Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("qmp.sock")) })
     }

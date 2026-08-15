@@ -14,3 +14,14 @@ firecracker_binary = "firecracker"
 # cloud_hypervisor_firmware = "/usr/share/cloud-hypervisor/CLOUDHV.fd"
 default_bridge = "vmbr0"
 reaper_interval_secs = 5
+
+# Every field is optional and defaults to unrestricted — uncomment only the
+# limits you want. An absent [policy] table (or this whole section commented
+# out) behaves exactly like the pre-policy MVP.
+# [policy]
+# max_vcpus = 8
+# max_memory_mib = 16384
+# max_disk_gib = 100
+# max_ttl_seconds = 86400          # every request must set a ttl_seconds <= this; unbounded VMs are rejected
+# allowed_backends = ["qemu", "firecracker"]
+# allowed_image_dirs = ["/var/lib/ephemera/images"]

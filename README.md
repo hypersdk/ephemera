@@ -275,6 +275,30 @@ Verified on real hardware (`scripts/test-auto-backend.sh`): all three resolution
 the chosen backend and answer over vsock, not just that `resolve_backend` returns the right enum
 value in isolation.
 
+## Policy (admission limits)
+
+`[policy]` in the config file (see `config.example.toml`) lets an operator cap what a `create`
+request is allowed to ask for. Every field is optional and defaults to unrestricted — an absent or
+empty `[policy]` table behaves exactly like no policy at all:
+
+```toml
+[policy]
+max_vcpus = 8
+max_memory_mib = 16384
+max_disk_gib = 100
+max_ttl_seconds = 86400          # every request must set ttl_seconds <= this; unbounded VMs are rejected
+allowed_backends = ["qemu", "firecracker"]
+allowed_image_dirs = ["/var/lib/ephemera/images"]
+```
+
+Checked once, right after `"auto"` resolves to a concrete backend and before any disk/network work
+starts, so a rejected request fails fast with a specific reason (`request vcpus (4) exceeds policy
+max_vcpus (2)`, `policy requires ttl_seconds to be set...`, `backend Firecracker is not permitted by
+policy allowed_backends [Qemu]`, etc.) rather than a generic 400. `allowed_image_dirs` is a plain
+path-prefix check — good enough to stop a tenant pointing `image` at an arbitrary host path, not a
+symlink-resistant sandboxing boundary. Verified against a real config on real hardware: all five
+cases (four rejections, one compliant create that actually boots) behave as documented.
+
 ## Pause, resume, and exec
 
 ```bash
@@ -511,7 +535,7 @@ assigned the same vsock CID.
 3. **Snapshots** — full VM state + disk snapshots per backend, and warm VM pools (pre-created paused VMs) for sub-second job start.
 4. **Storage abstraction** — qcow2, raw reflink, LVM thin, Ceph RBD, NVMe local, NBD.
 5. **Image catalog** — signed template manifests, distro/version/arch aliases, cosign/Sigstore or your own signing policy.
-6. **Policy** — max vCPU/RAM/disk/TTL, allowed VMMs, allowed images, allowed networking.
+6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).
 7. **Auth** — mTLS/OIDC, RBAC, tenant IDs and audit events, and an authenticated guest-agent protocol (today's vsock agent trusts any caller that can reach the VM's CID).
 8. **Observability** — tracing, per-VM boot timing and failure reasons (a basic Prometheus `/metrics` endpoint — VM counts by status/backend, agent-enabled count — is already implemented; see the REST API section).
 9. **Kubernetes CRD/operator** — `DisposableVM` CRD backed by node-local daemonsets (`ephemera-kube`).

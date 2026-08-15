@@ -51,6 +51,47 @@ pub fn resolve_backend(req: &CreateVmRequest, cfg: &Config) -> BackendKind {
     }
 }
 
+/// Admission check for `cfg.policy`, run once resolved (see `resolve_backend`)
+/// but before any disk/network work — a rejected request should be cheap.
+fn validate_policy(req: &CreateVmRequest, cfg: &Config) -> Result<()> {
+    let p = &cfg.policy;
+    if let Some(max) = p.max_vcpus {
+        if req.vcpus > max {
+            bail!("request vcpus ({}) exceeds policy max_vcpus ({max})", req.vcpus);
+        }
+    }
+    if let Some(max) = p.max_memory_mib {
+        if req.memory_mib > max {
+            bail!("request memory_mib ({}) exceeds policy max_memory_mib ({max})", req.memory_mib);
+        }
+    }
+    if let Some(max) = p.max_disk_gib {
+        if let Some(disk) = req.disk_size_gib {
+            if disk > max {
+                bail!("request disk_size_gib ({disk}) exceeds policy max_disk_gib ({max})");
+            }
+        }
+    }
+    if let Some(max) = p.max_ttl_seconds {
+        match req.ttl_seconds {
+            Some(ttl) if ttl > max => bail!("request ttl_seconds ({ttl}) exceeds policy max_ttl_seconds ({max})"),
+            None => bail!("policy requires ttl_seconds to be set (max_ttl_seconds={max}); unbounded VMs are not allowed"),
+            _ => {}
+        }
+    }
+    if let Some(allowed) = &p.allowed_backends {
+        if !allowed.contains(&req.backend) {
+            bail!("backend {:?} is not permitted by policy allowed_backends {:?}", req.backend, allowed);
+        }
+    }
+    if let Some(dirs) = &p.allowed_image_dirs {
+        if !dirs.iter().any(|d| req.image.starts_with(d)) {
+            bail!("image {} is not under any policy allowed_image_dirs {:?}", req.image.display(), dirs);
+        }
+    }
+    Ok(())
+}
+
 pub struct VmManager {
     pub cfg: Config,
     pub store: Arc<Store>,
@@ -68,6 +109,7 @@ impl VmManager {
         // (the disk filename, the persisted record, the launch dispatch)
         // assumes a concrete backend and must never see Auto.
         req.backend = resolve_backend(&req, &self.cfg);
+        validate_policy(&req, &self.cfg)?;
         if !req.image.exists() { bail!("base image does not exist: {}", req.image.display()); }
         let id = Uuid::new_v4();
         let workspace = self.cfg.state_dir.join("instances").join(id.to_string());
@@ -317,5 +359,80 @@ mod tests {
     #[test]
     fn backend_rejects_unresolved_auto() {
         assert!(backend(BackendKind::Auto).is_err());
+    }
+
+    fn req_with(vcpus: u8, memory_mib: u64, disk_size_gib: Option<u64>, ttl_seconds: Option<u64>, backend: BackendKind, image: &str) -> CreateVmRequest {
+        let mut r = req(backend, None, None);
+        r.vcpus = vcpus;
+        r.memory_mib = memory_mib;
+        r.disk_size_gib = disk_size_gib;
+        r.ttl_seconds = ttl_seconds;
+        r.image = image.into();
+        r
+    }
+
+    #[test]
+    fn empty_policy_allows_anything() {
+        let cfg = Config::default();
+        let r = req_with(64, 1_000_000, Some(9999), None, BackendKind::Qemu, "/anywhere/x.qcow2");
+        assert!(validate_policy(&r, &cfg).is_ok());
+    }
+
+    #[test]
+    fn policy_rejects_over_vcpu_limit() {
+        let mut cfg = Config::default();
+        cfg.policy.max_vcpus = Some(4);
+        let r = req_with(8, 512, None, None, BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&r, &cfg).is_err());
+    }
+
+    #[test]
+    fn policy_rejects_over_memory_limit() {
+        let mut cfg = Config::default();
+        cfg.policy.max_memory_mib = Some(2048);
+        let r = req_with(1, 4096, None, None, BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&r, &cfg).is_err());
+    }
+
+    #[test]
+    fn policy_rejects_over_disk_limit_but_allows_unset_disk() {
+        let mut cfg = Config::default();
+        cfg.policy.max_disk_gib = Some(50);
+        let over = req_with(1, 512, Some(100), None, BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&over, &cfg).is_err());
+        let unset = req_with(1, 512, None, None, BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&unset, &cfg).is_ok());
+    }
+
+    #[test]
+    fn policy_with_ttl_cap_rejects_both_unbounded_and_over_cap() {
+        let mut cfg = Config::default();
+        cfg.policy.max_ttl_seconds = Some(3600);
+        let unbounded = req_with(1, 512, None, None, BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&unbounded, &cfg).is_err());
+        let too_long = req_with(1, 512, None, Some(7200), BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&too_long, &cfg).is_err());
+        let ok = req_with(1, 512, None, Some(1800), BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&ok, &cfg).is_ok());
+    }
+
+    #[test]
+    fn policy_restricts_allowed_backends() {
+        let mut cfg = Config::default();
+        cfg.policy.allowed_backends = Some(vec![BackendKind::Firecracker]);
+        let qemu = req_with(1, 512, None, None, BackendKind::Qemu, "/x.qcow2");
+        assert!(validate_policy(&qemu, &cfg).is_err());
+        let fc = req_with(1, 512, None, None, BackendKind::Firecracker, "/x.qcow2");
+        assert!(validate_policy(&fc, &cfg).is_ok());
+    }
+
+    #[test]
+    fn policy_restricts_allowed_image_dirs() {
+        let mut cfg = Config::default();
+        cfg.policy.allowed_image_dirs = Some(vec!["/var/lib/ephemera/images".into()]);
+        let outside = req_with(1, 512, None, None, BackendKind::Qemu, "/tmp/evil.qcow2");
+        assert!(validate_policy(&outside, &cfg).is_err());
+        let inside = req_with(1, 512, None, None, BackendKind::Qemu, "/var/lib/ephemera/images/base.qcow2");
+        assert!(validate_policy(&inside, &cfg).is_ok());
     }
 }

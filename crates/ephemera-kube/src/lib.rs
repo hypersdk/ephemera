@@ -1,5 +1,10 @@
 // Copyright 2026 Zyvor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reserved for the Kubernetes `DisposableVM` CRD and operator described in the
-//! Zyvor Ephemera enterprise design. Not yet implemented.
+//! `DisposableVm` CRD + a node-local operator that reconciles them against a
+//! *local* `ephemera serve` instance's REST API. See `crd::DisposableVmSpec`
+//! for the per-node targeting model and `controller` for the reconcile loop.
+
+pub mod controller;
+pub mod crd;
+pub mod ephemera_client;

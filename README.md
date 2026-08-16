@@ -57,14 +57,14 @@ crates/
 ├── ephemera-api                   REST API (axum)
 ├── ephemera-cli                   `ephemera` CLI binary (composition root)
 ├── ephemera-agent                 reserved: per-host node-agent daemon (multi-node)
-└── ephemera-kube                  reserved: Kubernetes DisposableVM CRD/operator
+└── ephemera-kube                  DisposableVm CRD + node-local Kubernetes operator
 ```
 
-`ephemera-agent` (a distinct concept from `ephemera-guest-agent` above — this one
-is the future per-*host* node-agent for multi-node deployments) and `ephemera-kube`
-are placeholder crates for the distributed, Kubernetes-native deployment described
-below under "Production changes I would make next" — they are workspace members
-but contain no functionality yet.
+`ephemera-agent` (a distinct concept from `ephemera-guest-agent` above — this one is
+the still-deferred future per-*host* node-agent for multi-node deployments, and
+remains an empty placeholder — see "Production changes I would make next") is not
+to be confused with `ephemera-kube`, which is implemented and verified — see
+"Kubernetes CRD/operator" below.
 
 This project also depends on the sibling [`guestkit`](../guestkit) project (a
 pure-Rust, qemu-nbd-based disk toolkit) as a path dependency from `ephemera-image`,
@@ -100,6 +100,7 @@ for that step — see "Build an image" below.
 - SSH/rsync remote deploy script with full and quick profiles.
 - End-to-end networking smoke test (QEMU user-mode NAT, TAP+bridge+DHCP, and macvtap, all SSH-verified).
 - End-to-end lifecycle smoke test (vsock exec, pause/resume, graceful shutdown, and vsock-CID uniqueness under concurrent creates, all verified against real VMs).
+- Kubernetes `DisposableVm` CRD + node-local operator (`ephemera-kube`), verified against a real k3s cluster — see "Kubernetes CRD/operator" below.
 
 ## Host requirements
 
@@ -843,6 +844,66 @@ directly to the VMM (`-netdev tap,fd=N` for QEMU, `--net fd=N` for Cloud Hypervi
 persistent named tap the VMM opens itself, which is why **Firecracker doesn't support this mode**:
 its API only accepts a host device name it opens via `/dev/net/tun`, with no fd-passing option.
 
+## Kubernetes CRD/operator
+
+`ephemera-kube` is a `DisposableVm` custom resource plus a node-local operator that reconciles them
+against a *local* `ephemera serve` instance's REST API — there's no central scheduler placing VMs
+across a fleet (that's the still-deferred "distributed node-agent" item below); each node's operator
+instance only ever acts on `DisposableVm` objects whose `spec.node` matches the node name it was
+started with (`NODE_NAME` env var), same shape as a real daemonset even though this project doesn't
+yet package it as one (no container image build/push in this round — see "Not yet done" below).
+
+Verified end to end against a real k3s cluster (`scripts/test-kube-operator.sh`, 9/9 passing):
+generate the CRD straight from the Rust type and apply it, create a `DisposableVm`, watch it
+reconcile into a real, running QEMU VM (confirmed via the local REST API, not just "the CR looks
+fine"), delete the CR and confirm `kubectl delete` blocks on a finalizer until the real VM is
+actually gone — no leaked QEMU process.
+
+```bash
+# Generate + install the CRD once.
+ephemera-kube --print-crd | kubectl apply -f -
+
+# Run the operator on this node (typically one instance per node, alongside
+# a local `ephemera serve`).
+NODE_NAME=$(hostname) EPHEMERA_URL=http://127.0.0.1:7788 ephemera-kube
+```
+
+```yaml
+apiVersion: ephemera.zyvor.io/v1
+kind: DisposableVm
+metadata:
+  name: example
+spec:
+  node: worker-1          # must match some running operator's NODE_NAME
+  backend: qemu
+  image: /var/lib/ephemera/images/ubuntu.qcow2
+  vcpus: 2
+  memoryMib: 2048
+  networkMode: none        # "none" or "user" only — tap/macvtap need a device/bridge name this CRD doesn't expose yet
+  storage: default          # default | lvm-thin | nbd | ceph-rbd — see "Storage backends" above
+  ttlSeconds: 600
+```
+
+**Declarative, not one-shot** — a real, tested property, not just a design intention: if the
+underlying VM disappears on its own (its `ttlSeconds` expired, or something deleted it via the REST
+API directly) the operator notices on its next reconcile and creates a *new* VM to replace it — a
+different id, a different pid — the same "keep this existing" semantics a `Deployment` has for Pods.
+Confirmed by deleting a CR-owned VM out-of-band and watching a fresh one appear within two reconcile
+ticks, with no action taken on the CR itself. Only deleting the `DisposableVm` object itself stops
+this (see `DisposableVmStatus::phase`'s doc comment in `crates/ephemera-kube/src/crd.rs`).
+
+**Real bug found and fixed while testing this**: `ephemera-api`'s `ApiError` maps *every* error to a
+generic `400 Bad Request` — there's no distinct `404` anywhere in this API. The operator's initial
+"is this VM still there" check assumed 404-on-missing (the REST-idiomatic assumption) and never
+actually fired; a VM that vanished was reported as a transient error and endlessly retried instead of
+triggering recreation. Fixed by checking the response body's error message instead of the status code.
+
+**Not yet done**: packaging the operator as an actual container image + daemonset manifest (it was
+run as a plain host process against a real cluster for this round's verification, not deployed
+in-cluster); a `tap`/`macvtap` networking mode in the CRD (needs a device/bridge name field); and any
+cross-node placement — the "which node should this VM land on" decision is the caller's today, made
+by setting `spec.node` directly, not something this project chooses for you.
+
 ## State layout
 
 ```text
@@ -879,7 +940,7 @@ assigned the same vsock CID.
 6. **Policy** — allowed networking modes are still unrestricted (max vCPU/RAM/disk/TTL and allowed backends/image directories are already implemented; see "Policy (admission limits)" above).
 7. **Auth** — mTLS/OIDC, tenant IDs and audit events. Bearer-token REST auth/RBAC (admin/read-only) and a per-VM authenticated guest-agent protocol are already implemented; see "Auth / RBAC" and "Pause, resume, and exec" above.
 8. **Observability** — tracing, per-VM boot timing and failure reasons (a basic Prometheus `/metrics` endpoint — VM counts by status/backend, agent-enabled count — is already implemented; see the REST API section).
-9. **Kubernetes CRD/operator** — `DisposableVM` CRD backed by node-local daemonsets (`ephemera-kube`).
+9. **Kubernetes CRD/operator** — already implemented and verified against a real k3s cluster: `DisposableVm` CRD + node-local operator (`ephemera-kube`); see "Kubernetes CRD/operator" above. Not done: packaging it as a real container image/daemonset manifest, a tap/macvtap networking mode in the CRD, and cross-node placement.
 10. **Distributed node-agent** — `ephemera-agent` (the per-*host* one, not `ephemera-guest-agent`) running per hypervisor host, reporting to a central `ephemera-scheduler`.
 11. **Scheduler placement** — NUMA awareness, CPU pinning, hugepages and GPU/VFIO assignment.
 12. **Windows path** — QEMU/Cloud Hypervisor only; UEFI, virtio-win injection, sysprep and unattend support.

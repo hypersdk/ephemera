@@ -19,6 +19,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ephemera_core::config::Config;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -64,6 +65,109 @@ fn load_catalog(path: &Path) -> Result<Vec<CatalogEntry>> {
     serde_json::from_str(&raw).with_context(|| format!("parsing catalog {}", path.display()))
 }
 
+fn save_catalog(path: &Path, entries: &[CatalogEntry]) -> Result<()> {
+    // Write-then-rename so a reader never observes a half-written file.
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(entries)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("renaming into place: {}", path.display()))
+}
+
+fn catalog_path(cfg: &Config) -> Result<&Path> {
+    cfg.catalog.path.as_deref().context(
+        "no catalog.path configured — set [catalog] path in the Ephemera config to use the image catalog",
+    )
+}
+
+/// Register a new catalog entry — fetches `source` first if it's a URL and
+/// computes its sha256 fresh from what actually landed on disk (trusting a
+/// caller-supplied hash would just be trusting the caller; this proves
+/// what's really there, the same posture `resolve` already takes on every
+/// lookup). The entry is unsigned — signing is a separate, deliberately
+/// offline step (`ephemera catalog sign`).
+///
+/// Replaces machinectl's `pull-raw`/`import-raw` (a URL and a local path
+/// are handled identically here, same as everywhere else `source` is used).
+pub async fn add_entry(cfg: &Config, name: String, source: String, format: String) -> Result<CatalogEntry> {
+    let path = catalog_path(cfg)?;
+    let mut entries = if path.exists() { load_catalog(path)? } else { Vec::new() };
+    if entries.iter().any(|e| e.name == name) {
+        bail!("catalog entry '{name}' already exists");
+    }
+    let local = fetch_if_needed(cfg, &source).await.with_context(|| format!("fetching '{source}'"))?;
+    let bytes = fs::read(&local).with_context(|| format!("reading {}", local.display()))?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let entry = CatalogEntry { name, source, sha256, format, distro: None, version: None, arch: None, signature: None };
+    entries.push(entry.clone());
+    save_catalog(path, &entries)?;
+    Ok(entry)
+}
+
+/// Replaces machinectl's `remove`.
+pub fn remove_entry(cfg: &Config, name: &str) -> Result<()> {
+    let path = catalog_path(cfg)?;
+    let mut entries = load_catalog(path)?;
+    let before = entries.len();
+    entries.retain(|e| e.name != name);
+    if entries.len() == before {
+        bail!("catalog entry '{name}' not found");
+    }
+    save_catalog(path, &entries)
+}
+
+/// Replaces machinectl's `rename`. Clears any existing signature — a
+/// signature covers the entry's name (see `canonical_payload`), so a
+/// renamed entry's old signature no longer vouches for it.
+pub fn rename_entry(cfg: &Config, name: &str, new_name: &str) -> Result<CatalogEntry> {
+    let path = catalog_path(cfg)?;
+    let mut entries = load_catalog(path)?;
+    if name != new_name && entries.iter().any(|e| e.name == new_name) {
+        bail!("catalog entry '{new_name}' already exists");
+    }
+    let entry = entries
+        .iter_mut()
+        .find(|e| e.name == name)
+        .with_context(|| format!("catalog entry '{name}' not found"))?;
+    entry.name = new_name.to_string();
+    entry.signature = None;
+    let updated = entry.clone();
+    save_catalog(path, &entries)?;
+    Ok(updated)
+}
+
+/// Replaces machinectl's `clone`. The clone is unsigned, same reasoning as
+/// `rename_entry`.
+pub fn clone_entry(cfg: &Config, name: &str, target_name: &str) -> Result<CatalogEntry> {
+    let path = catalog_path(cfg)?;
+    let mut entries = load_catalog(path)?;
+    if entries.iter().any(|e| e.name == target_name) {
+        bail!("catalog entry '{target_name}' already exists");
+    }
+    let source_entry = entries
+        .iter()
+        .find(|e| e.name == name)
+        .with_context(|| format!("catalog entry '{name}' not found"))?
+        .clone();
+    let cloned = CatalogEntry { name: target_name.to_string(), signature: None, ..source_entry };
+    entries.push(cloned.clone());
+    save_catalog(path, &entries)?;
+    Ok(cloned)
+}
+
+/// Replaces machinectl's `export-raw`: copies the entry's resolved local
+/// file (fetching it first if `source` is a URL not yet cached) to `dest`.
+pub async fn export_entry(cfg: &Config, name: &str, dest: &Path) -> Result<()> {
+    let path = catalog_path(cfg)?;
+    let entries = load_catalog(path)?;
+    let entry = entries.iter().find(|e| e.name == name).with_context(|| format!("catalog entry '{name}' not found"))?;
+    let local = fetch_if_needed(cfg, &entry.source).await?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::copy(&local, dest).with_context(|| format!("copying {} to {}", local.display(), dest.display()))?;
+    Ok(())
+}
+
 fn parse_public_key(b64: &str) -> Result<VerifyingKey> {
     let bytes = B64.decode(b64).context("trusted_signers entry is not valid base64")?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("public key must be 32 bytes, got {}", v.len()))?;
@@ -99,6 +203,11 @@ fn verify_signature(entry: &CatalogEntry, trusted: &[VerifyingKey]) -> Result<()
 pub async fn resolve(cfg: &Config, image_ref: &Path) -> Result<PathBuf> {
     let Some(catalog_path) = &cfg.catalog.path else { return Ok(image_ref.to_path_buf()) };
     let Some(ref_str) = image_ref.to_str() else { return Ok(image_ref.to_path_buf()) };
+    // A configured-but-not-yet-created catalog matches nothing — every
+    // image_ref passes through unchanged, same as catalog.path being unset.
+    if !catalog_path.exists() {
+        return Ok(image_ref.to_path_buf());
+    }
 
     let catalog = load_catalog(catalog_path)?;
     let Some(entry) = catalog.iter().find(|e| e.name == ref_str) else {
@@ -134,6 +243,11 @@ pub struct CatalogListEntry {
 /// logic client-side.
 pub fn list_with_verification(cfg: &Config) -> Result<Vec<CatalogListEntry>> {
     let Some(catalog_path) = &cfg.catalog.path else { return Ok(Vec::new()) };
+    // A configured-but-not-yet-created catalog is an empty catalog, not an
+    // error — nothing has called add_entry yet.
+    if !catalog_path.exists() {
+        return Ok(Vec::new());
+    }
     let catalog = load_catalog(catalog_path)?;
     let keys: Vec<VerifyingKey> = cfg.catalog.trusted_signers.iter().map(|s| parse_public_key(s)).collect::<Result<_>>()
         .context("parsing config.catalog.trusted_signers")?;

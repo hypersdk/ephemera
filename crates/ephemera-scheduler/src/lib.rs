@@ -110,6 +110,10 @@ pub struct VmManager {
     /// each other) serialize instead of both creating members past `size`;
     /// backfills for *different* pools still run fully in parallel.
     backfill_locks: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Serializes catalog.json read-modify-write cycles — add/remove/
+    /// rename/clone all load the whole file, mutate, and write it back, so
+    /// two concurrent calls need to not interleave.
+    catalog_lock: AsyncMutex<()>,
 }
 
 impl VmManager {
@@ -125,7 +129,46 @@ impl VmManager {
         if let Err(e) = ephemera_cgroup::ensure_delegation() {
             tracing::warn!(error = %e, "failed to delegate cgroup controllers — resource control/metrics will be unavailable");
         }
-        Ok(Arc::new(Self { cfg, store, pools, backfill_locks: AsyncMutex::new(HashMap::new()) }))
+        Ok(Arc::new(Self {
+            cfg,
+            store,
+            pools,
+            backfill_locks: AsyncMutex::new(HashMap::new()),
+            catalog_lock: AsyncMutex::new(()),
+        }))
+    }
+
+    /// Register a new image catalog entry — see `ephemera_image::catalog::add_entry`.
+    pub async fn add_catalog_entry(&self, name: String, source: String, format: String) -> Result<ephemera_image::catalog::CatalogEntry> {
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::add_entry(&self.cfg, name, source, format).await
+    }
+
+    /// Remove an image catalog entry — see `ephemera_image::catalog::remove_entry`.
+    pub async fn remove_catalog_entry(&self, name: &str) -> Result<()> {
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::remove_entry(&self.cfg, name)
+    }
+
+    /// Rename an image catalog entry — see `ephemera_image::catalog::rename_entry`.
+    pub async fn rename_catalog_entry(&self, name: &str, new_name: &str) -> Result<ephemera_image::catalog::CatalogEntry> {
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::rename_entry(&self.cfg, name, new_name)
+    }
+
+    /// Clone an image catalog entry under a new name — see `ephemera_image::catalog::clone_entry`.
+    pub async fn clone_catalog_entry(&self, name: &str, target_name: &str) -> Result<ephemera_image::catalog::CatalogEntry> {
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::clone_entry(&self.cfg, name, target_name)
+    }
+
+    /// Export a catalog entry's resolved file to `dest` — see `ephemera_image::catalog::export_entry`.
+    pub async fn export_catalog_entry(&self, name: &str, dest: &std::path::Path) -> Result<()> {
+        // No write to catalog.json here, but still serialized against
+        // add/remove/rename/clone so a concurrent rename can't yank the
+        // entry out from under an in-flight export's lookup.
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::export_entry(&self.cfg, name, dest).await
     }
 
     /// Create the VM's cgroup and migrate `pid` into it, storing the

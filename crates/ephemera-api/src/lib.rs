@@ -6,7 +6,7 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
 use ephemera_core::{
@@ -17,6 +17,7 @@ use ephemera_image::{self as image, BuildImageRequest};
 use ephemera_scheduler::VmManager;
 use serde::Deserialize;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -93,6 +94,11 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/logs", get(vm_logs))
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/images/build", post(build_image))
+        .route("/v1/images/catalog", post(add_catalog_entry))
+        .route("/v1/images/catalog/{name}", delete(remove_catalog_entry))
+        .route("/v1/images/catalog/{name}/rename", post(rename_catalog_entry))
+        .route("/v1/images/catalog/{name}/clone", post(clone_catalog_entry))
+        .route("/v1/images/catalog/{name}/export", post(export_catalog_entry))
         .route("/v1/images/catalog", get(list_catalog))
         .route("/v1/pools", post(create_pool).get(list_pools))
         .route("/v1/pools/{name}", get(get_pool).delete(delete_pool))
@@ -339,6 +345,81 @@ async fn build_image(State(m): State<Arc<VmManager>>, Extension(role): Extension
 /// exposed here, so private keys never touch this API's surface.
 async fn list_catalog(State(m): State<Arc<VmManager>>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!({"items": image::catalog::list_with_verification(&m.cfg)?})))
+}
+
+#[derive(Deserialize)]
+struct AddCatalogEntryRequest {
+    name: String,
+    /// Local path or `http(s)://` URL — see `CatalogEntry::source`.
+    source: String,
+    #[serde(default = "default_catalog_format")]
+    format: String,
+}
+fn default_catalog_format() -> String { "qcow2".into() }
+
+async fn add_catalog_entry(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Json(req): Json<AddCatalogEntryRequest>,
+) -> ApiResult<impl IntoResponse> {
+    require_admin(role)?;
+    let entry = m.add_catalog_entry(req.name, req.source, req.format).await?;
+    Ok((StatusCode::CREATED, Json(json!(entry))))
+}
+
+async fn remove_catalog_entry(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_admin(role)?;
+    m.remove_catalog_entry(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct RenameCatalogEntryRequest {
+    new_name: String,
+}
+async fn rename_catalog_entry(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(name): Path<String>,
+    Json(req): Json<RenameCatalogEntryRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    let entry = m.rename_catalog_entry(&name, &req.new_name).await?;
+    Ok(Json(json!(entry)))
+}
+
+#[derive(Deserialize)]
+struct CloneCatalogEntryRequest {
+    target_name: String,
+}
+async fn clone_catalog_entry(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(name): Path<String>,
+    Json(req): Json<CloneCatalogEntryRequest>,
+) -> ApiResult<impl IntoResponse> {
+    require_admin(role)?;
+    let entry = m.clone_catalog_entry(&name, &req.target_name).await?;
+    Ok((StatusCode::CREATED, Json(json!(entry))))
+}
+
+#[derive(Deserialize)]
+struct ExportCatalogEntryRequest {
+    path: PathBuf,
+}
+async fn export_catalog_entry(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(name): Path<String>,
+    Json(req): Json<ExportCatalogEntryRequest>,
+) -> ApiResult<StatusCode> {
+    require_admin(role)?;
+    m.export_catalog_entry(&name, &req.path).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_pool(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(spec): Json<PoolSpec>) -> ApiResult<impl IntoResponse> {

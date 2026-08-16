@@ -86,6 +86,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/pause", post(pause_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/resources", post(set_vm_resources))
+        .route("/v1/vms/{id}/cpuset", get(vm_cpuset))
         .route("/v1/vms/{id}/freeze", post(freeze_vm))
         .route("/v1/vms/{id}/thaw", post(thaw_vm))
         .route("/v1/vms/{id}/frozen", get(vm_frozen))
@@ -239,6 +240,10 @@ async fn vm_stats(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiR
 
 async fn vm_pressure(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!(m.pressure(id).await?)))
+}
+
+async fn vm_cpuset(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(json!({"cpus": m.get_cpuset(id).await?})))
 }
 
 #[derive(Debug, Deserialize)]

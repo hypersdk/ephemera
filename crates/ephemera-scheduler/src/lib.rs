@@ -226,6 +226,13 @@ impl VmManager {
         Ok(())
     }
 
+    /// The cpuset currently pinned via `set_resources`'s `cpuset_cpus`, or
+    /// empty if never set (cgroup default: unrestricted).
+    pub async fn get_cpuset(&self, id: Uuid) -> Result<Vec<u32>> {
+        let vm = self.get(id).await?;
+        Ok(self.cgroup_manager(&vm)?.cpuset().get_cpus()?)
+    }
+
     pub async fn freeze(&self, id: Uuid) -> Result<()> {
         let vm = self.get(id).await?;
         Ok(self.cgroup_manager(&vm)?.freezer().freeze()?)

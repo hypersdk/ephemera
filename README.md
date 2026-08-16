@@ -581,11 +581,38 @@ With `trusted_signers` set, an unsigned (or wrongly-signed) catalog entry is rej
 with a computed `signature_valid` (read-only; signing stays a CLI/offline operation, so private keys
 never touch the API surface).
 
+**Catalog CRUD over REST** — add/remove/rename/clone/export entries without hand-editing
+`catalog.json` or going through the CLI's offline sign flow (this is what zyvor-fabric's
+`EphemeraDriver::ImageDriver` uses to replace machinectl's image-management verbs):
+
+```bash
+# Register a new entry — source can be a local path or an http(s) URL; sha256 is computed
+# fresh from what actually lands on disk, not trusted from the caller.
+curl -sS -X POST http://127.0.0.1:7788/v1/images/catalog \
+  -H 'content-type: application/json' \
+  -d '{"name": "ubuntu-24.04", "source": "/var/lib/ephemera/images/ubuntu.qcow2", "format": "qcow2"}' | jq
+
+curl -sS -X POST http://127.0.0.1:7788/v1/images/catalog/ubuntu-24.04/clone \
+  -d '{"target_name": "ubuntu-24.04-staging"}' | jq
+curl -sS -X POST http://127.0.0.1:7788/v1/images/catalog/ubuntu-24.04-staging/rename \
+  -d '{"new_name": "ubuntu-24.04-qa"}' | jq
+curl -sS -X POST http://127.0.0.1:7788/v1/images/catalog/ubuntu-24.04/export \
+  -d '{"path": "/var/lib/ephemera/exports/ubuntu-24.04.qcow2"}' | jq
+curl -sS -X DELETE http://127.0.0.1:7788/v1/images/catalog/ubuntu-24.04-qa
+```
+
+A clone or rename drops any existing signature (a signature covers the entry's `name`, so it no
+longer vouches for the new one). All five mutating operations are serialized against each other and
+against a fresh `catalog.json` read on every call — no in-memory cache to go stale.
+
 Verified on real hardware (`scripts/test-image-catalog.sh`, 10/10): `keygen`/`sign` produce a real
 verifiable entry; creating a VM by catalog name actually resolves and boots the underlying image; with
 `trusted_signers` configured, an unsigned entry is rejected while a validly signed one is accepted (both
 confirmed by actually trying to boot); a plain literal path still works unchanged; `GET
-/v1/images/catalog` correctly reports `signature_valid: true`/`false` for the two cases.
+/v1/images/catalog` correctly reports `signature_valid: true`/`false` for the two cases. The CRUD
+endpoints above were verified live against a real deployed instance: full add → list → clone →
+rename → export (byte-identical file at the destination) → delete round trip, plus the duplicate-name
+and not-found error paths.
 
 ## Storage backends
 
@@ -696,6 +723,11 @@ POST   /v1/vms/{uuid}/agent
 DELETE /v1/vms/{uuid}
 POST   /v1/images/build
 GET    /v1/images/catalog
+POST   /v1/images/catalog
+DELETE /v1/images/catalog/{name}
+POST   /v1/images/catalog/{name}/rename
+POST   /v1/images/catalog/{name}/clone
+POST   /v1/images/catalog/{name}/export
 POST   /v1/pools
 GET    /v1/pools
 GET    /v1/pools/{name}

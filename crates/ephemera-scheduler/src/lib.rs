@@ -171,6 +171,18 @@ impl VmManager {
         ephemera_image::catalog::export_entry(&self.cfg, name, dest).await
     }
 
+    /// Toggle a catalog entry's read-only flag — see `ephemera_image::catalog::set_read_only`.
+    pub async fn set_catalog_read_only(&self, name: &str, read_only: bool) -> Result<ephemera_image::catalog::CatalogEntry> {
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::set_read_only(&self.cfg, name, read_only)
+    }
+
+    /// Remove orphaned cached downloads — see `ephemera_image::catalog::clean_downloads`.
+    pub async fn clean_catalog_downloads(&self) -> Result<Vec<String>> {
+        let _guard = self.catalog_lock.lock().await;
+        ephemera_image::catalog::clean_downloads(&self.cfg)
+    }
+
     /// Create the VM's cgroup and migrate `pid` into it, storing the
     /// resulting path on `record`. Best-effort and non-fatal: a VM whose
     /// cgroup setup fails still runs — it just can't be resource-controlled

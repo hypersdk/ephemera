@@ -99,6 +99,11 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/images/catalog/{name}/rename", post(rename_catalog_entry))
         .route("/v1/images/catalog/{name}/clone", post(clone_catalog_entry))
         .route("/v1/images/catalog/{name}/export", post(export_catalog_entry))
+        .route(
+            "/v1/images/catalog/{name}/read-only",
+            post(set_catalog_read_only),
+        )
+        .route("/v1/images/catalog/clean", post(clean_catalog))
         .route("/v1/images/catalog", get(list_catalog))
         .route("/v1/pools", post(create_pool).get(list_pools))
         .route("/v1/pools/{name}", get(get_pool).delete(delete_pool))
@@ -420,6 +425,30 @@ async fn export_catalog_entry(
     require_admin(role)?;
     m.export_catalog_entry(&name, &req.path).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SetCatalogReadOnlyRequest {
+    read_only: bool,
+}
+async fn set_catalog_read_only(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(name): Path<String>,
+    Json(req): Json<SetCatalogReadOnlyRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    let entry = m.set_catalog_read_only(&name, req.read_only).await?;
+    Ok(Json(json!(entry)))
+}
+
+async fn clean_catalog(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    let removed = m.clean_catalog_downloads().await?;
+    Ok(Json(json!({"removed": removed})))
 }
 
 async fn create_pool(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Json(spec): Json<PoolSpec>) -> ApiResult<impl IntoResponse> {

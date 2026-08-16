@@ -50,6 +50,11 @@ pub struct CatalogEntry {
     /// `Config::catalog.trusted_signers` is non-empty — see [`resolve`].
     #[serde(default)]
     pub signature: Option<String>,
+    /// When `true`, [`remove_entry`]/[`rename_entry`] refuse to act on this
+    /// entry — mirrors machinectl's per-image read-only flag, used to
+    /// protect a base image other entries are cloned from.
+    #[serde(default)]
+    pub read_only: bool,
 }
 fn default_format() -> String { "qcow2".into() }
 
@@ -97,16 +102,22 @@ pub async fn add_entry(cfg: &Config, name: String, source: String, format: Strin
     let local = fetch_if_needed(cfg, &source).await.with_context(|| format!("fetching '{source}'"))?;
     let bytes = fs::read(&local).with_context(|| format!("reading {}", local.display()))?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let entry = CatalogEntry { name, source, sha256, format, distro: None, version: None, arch: None, signature: None };
+    let entry = CatalogEntry { name, source, sha256, format, distro: None, version: None, arch: None, signature: None, read_only: false };
     entries.push(entry.clone());
     save_catalog(path, &entries)?;
     Ok(entry)
 }
 
-/// Replaces machinectl's `remove`.
+/// Replaces machinectl's `remove`. Refuses a `read_only` entry — see
+/// [`set_read_only`].
 pub fn remove_entry(cfg: &Config, name: &str) -> Result<()> {
     let path = catalog_path(cfg)?;
     let mut entries = load_catalog(path)?;
+    if let Some(entry) = entries.iter().find(|e| e.name == name) {
+        if entry.read_only {
+            bail!("catalog entry '{name}' is read-only; clear it first");
+        }
+    }
     let before = entries.len();
     entries.retain(|e| e.name != name);
     if entries.len() == before {
@@ -117,7 +128,8 @@ pub fn remove_entry(cfg: &Config, name: &str) -> Result<()> {
 
 /// Replaces machinectl's `rename`. Clears any existing signature — a
 /// signature covers the entry's name (see `canonical_payload`), so a
-/// renamed entry's old signature no longer vouches for it.
+/// renamed entry's old signature no longer vouches for it. Refuses a
+/// `read_only` entry, same as [`remove_entry`].
 pub fn rename_entry(cfg: &Config, name: &str, new_name: &str) -> Result<CatalogEntry> {
     let path = catalog_path(cfg)?;
     let mut entries = load_catalog(path)?;
@@ -128,11 +140,67 @@ pub fn rename_entry(cfg: &Config, name: &str, new_name: &str) -> Result<CatalogE
         .iter_mut()
         .find(|e| e.name == name)
         .with_context(|| format!("catalog entry '{name}' not found"))?;
+    if entry.read_only {
+        bail!("catalog entry '{name}' is read-only; clear it first");
+    }
     entry.name = new_name.to_string();
     entry.signature = None;
     let updated = entry.clone();
     save_catalog(path, &entries)?;
     Ok(updated)
+}
+
+/// Toggle an entry's `read_only` flag. Replaces machinectl's per-image
+/// read-only bit — used to protect a base image other entries are cloned
+/// from ([`clone_entry`] itself is unaffected either way, since cloning
+/// doesn't mutate the source).
+pub fn set_read_only(cfg: &Config, name: &str, read_only: bool) -> Result<CatalogEntry> {
+    let path = catalog_path(cfg)?;
+    let mut entries = load_catalog(path)?;
+    let entry = entries
+        .iter_mut()
+        .find(|e| e.name == name)
+        .with_context(|| format!("catalog entry '{name}' not found"))?;
+    entry.read_only = read_only;
+    let updated = entry.clone();
+    save_catalog(path, &entries)?;
+    Ok(updated)
+}
+
+/// Replaces machinectl's `clean`: removes cached downloads under
+/// `state_dir/downloads` that no current catalog entry's `source` still
+/// references by filename — the download cache's only orphans, since
+/// entries themselves are never "hidden," unlike machinectl's per-machine
+/// image cache. Returns the filenames removed.
+pub fn clean_downloads(cfg: &Config) -> Result<Vec<String>> {
+    let downloads = cfg.state_dir.join("downloads");
+    if !downloads.exists() {
+        return Ok(Vec::new());
+    }
+    let referenced: std::collections::HashSet<String> = match &cfg.catalog.path {
+        Some(path) if path.exists() => load_catalog(path)?
+            .into_iter()
+            .filter_map(|e| {
+                e.source
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    };
+    let mut removed = Vec::new();
+    for entry in fs::read_dir(&downloads).with_context(|| format!("reading {}", downloads.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if referenced.contains(&name) {
+            continue;
+        }
+        fs::remove_file(entry.path()).with_context(|| format!("removing {}", entry.path().display()))?;
+        removed.push(name);
+    }
+    Ok(removed)
 }
 
 /// Replaces machinectl's `clone`. The clone is unsigned, same reasoning as
@@ -285,7 +353,7 @@ pub fn sign_entry(
     let key_arr: [u8; 32] = key_bytes.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("private key must be 32 bytes, got {}", v.len()))?;
     let signing_key = SigningKey::from_bytes(&key_arr);
 
-    let mut entry = CatalogEntry { name, source, sha256, format, distro, version, arch, signature: None };
+    let mut entry = CatalogEntry { name, source, sha256, format, distro, version, arch, signature: None, read_only: false };
     let signature = signing_key.sign(canonical_payload(&entry).as_bytes());
     entry.signature = Some(B64.encode(signature.to_bytes()));
     Ok(entry)
@@ -339,6 +407,7 @@ mod tests {
             version: None,
             arch: None,
             signature: None,
+            read_only: false,
         }]);
         let cfg = cfg_with_catalog(&catalog_path, vec![]); // no trusted_signers -> signature not required
 
@@ -362,6 +431,7 @@ mod tests {
             version: None,
             arch: None,
             signature: None,
+            read_only: false,
         }]);
         let cfg = cfg_with_catalog(&catalog_path, vec![]);
 
@@ -421,10 +491,66 @@ mod tests {
             version: None,
             arch: None,
             signature: None, // unsigned
+            read_only: false,
         }]);
         let cfg = cfg_with_catalog(&catalog_path, vec![public_b64]);
 
         let err = resolve(&cfg, Path::new("test-image")).await.unwrap_err();
         assert!(format!("{err:#}").contains("no signature"), "unexpected error: {err:#}");
+    }
+
+    #[test]
+    fn read_only_entry_refuses_remove_and_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_path = write_catalog(dir.path(), &[CatalogEntry {
+            name: "base".into(),
+            source: "/irrelevant".into(),
+            sha256: "irrelevant".into(),
+            format: "qcow2".into(),
+            distro: None,
+            version: None,
+            arch: None,
+            signature: None,
+            read_only: false,
+        }]);
+        let cfg = cfg_with_catalog(&catalog_path, vec![]);
+
+        set_read_only(&cfg, "base", true).unwrap();
+        assert!(remove_entry(&cfg, "base").unwrap_err().to_string().contains("read-only"));
+        assert!(rename_entry(&cfg, "base", "base2").unwrap_err().to_string().contains("read-only"));
+
+        set_read_only(&cfg, "base", false).unwrap();
+        remove_entry(&cfg, "base").unwrap();
+    }
+
+    #[tokio::test]
+    async fn clean_downloads_removes_only_unreferenced_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(downloads.join("kept.qcow2"), b"kept").unwrap();
+        fs::write(downloads.join("orphan.qcow2"), b"orphan").unwrap();
+
+        let catalog_path = write_catalog(dir.path(), &[CatalogEntry {
+            name: "kept".into(),
+            source: "https://example.invalid/kept.qcow2".into(),
+            sha256: "irrelevant".into(),
+            format: "qcow2".into(),
+            distro: None,
+            version: None,
+            arch: None,
+            signature: None,
+            read_only: false,
+        }]);
+        let cfg = Config {
+            state_dir: dir.path().to_path_buf(),
+            catalog: CatalogConfig { path: Some(catalog_path), trusted_signers: vec![] },
+            ..Config::default()
+        };
+
+        let removed = clean_downloads(&cfg).unwrap();
+        assert_eq!(removed, vec!["orphan.qcow2".to_string()]);
+        assert!(downloads.join("kept.qcow2").exists());
+        assert!(!downloads.join("orphan.qcow2").exists());
     }
 }

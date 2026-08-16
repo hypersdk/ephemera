@@ -256,7 +256,7 @@ fn open_shell(
         Ok(cmd.spawn()?)
     })();
 
-    let mut child = match spawn_result {
+    let child = match spawn_result {
         Ok(c) => c,
         Err(e) => {
             unsafe { libc::close(master_fd) };
@@ -319,18 +319,28 @@ fn open_shell(
     drop(done_tx);
     let _ = done_rx.recv();
 
-    // Kill/reap on a detached thread, not here: found live that
-    // `child.kill()`/`.wait()`/`.try_wait()` called from *this* thread
-    // (which had earlier done the posix_openpt/grantpt/spawn calls above)
-    // block indefinitely under real vsock/PTY load in a way a brand-new
-    // thread doing the identical calls does not — root cause not
-    // identified. This keeps a session ending from ever wedging the
-    // connection handler even though it doesn't explain the underlying
-    // hang; see the Ephemera README's known-issues section.
-    std::thread::spawn(move || {
-        let _ = child.kill();
-        let _ = child.wait();
-    });
+    // Deliberately never call kill()/wait()/try_wait() on `child`. The
+    // guest agent's *listener* was found, live, to sometimes go
+    // permanently unreachable after an OpenShell session — process/thread
+    // tracing shows its accept() thread parked in the kernel's
+    // vsock_accept and never woken again. This looked at first like a
+    // clean, deterministic trigger (explicit kill()/try_wait() on this
+    // session-leader-with-a-controlling-terminal child), and code here
+    // avoided both for a while on that theory — but a larger batch of
+    // live trials with that avoidance in place still failed intermittently
+    // (~1 in 3, no code difference between passing and failing runs), so
+    // that theory is WRONG, or at best incomplete: this is an
+    // intermittent, low-probability race, not something this function
+    // deterministically controls. Left as never-reap anyway since it's
+    // at worst neutral (a slow, bounded-by-sessions-ever-opened zombie
+    // leak — `master_in`/`master_out` already closed above delivers
+    // SIGHUP to the shell on a real TTY, so a plain `sh` exits on its own
+    // without our ever needing to signal it) and it removes one variable
+    // instead of adding one. See the Ephemera README's "Interactive
+    // console" section — this needs kernel-level tooling (ftrace, a
+    // controlled non-shared host) to actually root-cause, not more
+    // trial-and-error from this function.
+    drop(child);
     // Don't join to_shell/to_client either: whichever side didn't finish
     // is still blocked on its own read (the peer hasn't closed that half
     // yet) — it'll unblock and exit on its own once `conn`/the PTY master

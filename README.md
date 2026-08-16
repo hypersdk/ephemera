@@ -420,21 +420,28 @@ end-to-end to a real PTY-backed `/bin/sh` in the guest over the same vsock agent
 `exec` (see `ephemera_vsock_client::open_shell`) — real keystrokes, real job control, verified live
 against a real QEMU VM (connect, `echo` a marker string, see it echoed back through the PTY).
 
-**Known issue, not yet fixed:** after one console session ends, the guest agent's vsock listener on
-that VM stops accepting new connections — a second `exec`/console/file-copy call to the same VM then
-fails with a raw `Connection reset by peer`, even though the guest kernel itself is still alive and
-making progress (confirmed by watching its boot log continue in parallel). Isolated live to
-`ephemera-guest-agent`'s `open_shell()`: `child.kill()`/`.wait()`/`.try_wait()`, called from the same
-thread that earlier did `posix_openpt`/`grantpt`/spawned the shell, block indefinitely — a brand-new
-thread doing the identical calls does not. The current code hands reaping off to a detached thread so
-a session ending can't wedge the connection handler itself, but that only stops this one thread from
-hanging — it does not explain, or fix, why the *listener* goes unreachable afterward. Because of this,
-`zyvor-fabric`'s Ephemera driver does not request `agent.enabled: true` by default yet (see its own
-`docs/guides/vm-drivers/ephemera.md`) — flipping that on before this is root-caused would break
-`exec`/file-copy on any VM a user opened a console session on. Reproduce with a raw two-line vsock
-probe (connect, send an `OpenShell` request, read the `ShellOpened` ack, disconnect) followed by an
-`exec` call to the same VM; a debugger/strace session on the guest, not a black-box test over vsock,
-is very likely what it'll take to find the actual cause.
+**Known issue, not yet fixed — intermittent, not deterministic:** sometimes, after one console
+session ends, the guest agent's vsock listener on that VM stops accepting new connections — a
+subsequent `exec`/console/file-copy call to the same VM then fails with a raw `Connection reset by
+peer`, even though the guest kernel itself is still alive and making progress (confirmed by watching
+its boot log continue in parallel). Process/thread tracing shows the listener's accept() thread
+parked in the kernel's `vsock_accept` and never woken again.
+
+This is **not** a clean, reproducible-every-time bug, and an earlier version of this note claimed a
+specific deterministic trigger (`child.kill()`/`.wait()`/`.try_wait()` on the spawned shell, called
+from the thread that set its PTY up) that turned out to be wrong: `ephemera-guest-agent` now never
+calls kill()/wait() on that child at all (see the comment in `open_shell()`), and a batch of live
+trials with that in place still failed roughly 1 in 3 with no code difference between the passing and
+failing runs. That rules out a userspace-guest-agent-code root cause with reasonable confidence — this
+looks like a genuine, intermittent race in the kernel's `AF_VSOCK`/`vhost_vsock` accept path,
+triggered by something about a PTY-owning session leader existing and/or exiting on the same vsock
+CID, not by anything this process's own code does afterward. Chasing it further black-box, one live
+QEMU-boot-and-probe cycle at a time on a shared host, has diminishing returns; it needs kernel-level
+tooling (ftrace, a controlled non-shared host, ideally a from-scratch minimal C reproducer that
+doesn't need Ephemera at all) to actually root-cause. Because of this, `zyvor-fabric`'s Ephemera
+driver does not request `agent.enabled: true` by default yet (see its own
+`docs/guides/vm-drivers/ephemera.md`) — flipping that on before this is understood would break
+`exec`/console/file-copy on some fraction of real VMs.
 
 ## Resource control (cgroup v2)
 

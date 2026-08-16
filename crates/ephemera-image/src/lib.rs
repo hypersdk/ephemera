@@ -235,9 +235,33 @@ fn install_packages(g: &mut guestkit::Guestfs, packages: &[String]) -> Result<()
             g.command(&args).context("package install")?;
         }
         Some("pacman") => {
+            // A fresh Arch image ships with an empty pacman keyring, so
+            // every install fails signature verification until it's
+            // initialized — real, standard Arch chroot bootstrapping, not
+            // specific to this bare chroot (confirmed against a real Arch
+            // Linux cloud image).
+            g.command(&["pacman-key", "--init"]).context("pacman-key --init")?;
+            g.command(&["pacman-key", "--populate", "archlinux"]).context("pacman-key --populate")?;
             let mut args = vec!["pacman", "-Sy", "--noconfirm"];
             args.extend(pkgs);
-            g.command(&args).context("pacman install")?;
+            let result = with_staged_mtab(g, |g| g.command(&args).context("pacman install").map(|_| ()));
+            // pacman-key/pacman spawn a gpg-agent that double-forks and
+            // detaches, inheriting the chroot's root directory — guestkit's
+            // chroot exec only waits on the direct child, so the detached
+            // agent leaks with open files under the mount, which blocks
+            // the unmount at the end of customize_image_blocking. There's
+            // no PID namespace isolation (chroot doesn't create one), so
+            // it's a real, host-visible process — reap it with a host-side
+            // `pkill`, not `g.command`: a `pkill` run *inside* the chroot
+            // needs `/proc` to enumerate processes, which this bare chroot
+            // doesn't have (the same limitation noted on
+            // `customize_image_blocking`), so it would silently match
+            // nothing. Pattern is scoped to pacman-key's specific homedir
+            // to avoid touching an unrelated gpg-agent on the host.
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-f", "gpg-agent --homedir /etc/pacman.d/gnupg"])
+                .status();
+            result?;
         }
         _ => bail!(
             "cannot install packages: no supported package manager found in the guest \
@@ -246,6 +270,33 @@ fn install_packages(g: &mut guestkit::Guestfs, packages: &[String]) -> Result<()
         ),
     }
     Ok(())
+}
+
+/// Runs `f` with a synthetic `/etc/mtab` in place, restoring/removing it
+/// afterward. `pacman` refuses to run at all without a readable
+/// `/etc/mtab` (it parses it to work out which filesystem the install
+/// target lives on) — on a real Arch system that's a symlink to
+/// `/proc/self/mounts`, which this bare chroot doesn't have (no `/proc`
+/// bind-mount, the same limitation noted on [`customize_image_blocking`]).
+/// A single plausible-looking `rw` entry is enough to satisfy the parse;
+/// pacman doesn't need it to reflect the real mount table. Confirmed
+/// necessary against a real Arch Linux cloud image (`apt-get`/`dnf` never
+/// needed this, so it's scoped to the pacman path only).
+fn with_staged_mtab(
+    g: &mut guestkit::Guestfs,
+    f: impl FnOnce(&mut guestkit::Guestfs) -> Result<()>,
+) -> Result<()> {
+    let original = g.read_file("/etc/mtab").ok();
+    let _ = g.command(&["rm", "-f", "/etc/mtab"]);
+    g.write("/etc/mtab", b"rootfs / rootfs rw 0 0\n").context("staging /etc/mtab for pacman")?;
+
+    let result = f(g);
+
+    let _ = g.command(&["rm", "-f", "/etc/mtab"]);
+    if let Some(bytes) = &original {
+        let _ = g.write("/etc/mtab", bytes);
+    }
+    result
 }
 
 /// Authorizes `key` for root login by appending it to

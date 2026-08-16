@@ -31,6 +31,13 @@
 #
 # Usage:
 #   sudo ./scripts/test-image-customize.sh --image /var/lib/ephemera/images/ubuntu-noble.qcow2
+#
+# The base image's distro determines which package-manager branch of
+# install_packages() actually runs (apt-get/dnf/tdnf/yum/pacman, detected
+# live from the image). TEST_PACKAGE/TEST_SERVICE default to Debian/Ubuntu
+# names (tree/cron) — override them for other families, e.g.:
+#   TEST_SERVICE=crond sudo -E ./scripts/test-image-customize.sh --image rocky9.qcow2   # dnf
+#   TEST_SERVICE=cronie sudo -E ./scripts/test-image-customize.sh --image arch.qcow2    # pacman
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +45,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 IMAGE=""
 TEST_PACKAGE="${TEST_PACKAGE:-tree}"
+TEST_SERVICE="${TEST_SERVICE:-cron}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -104,7 +112,7 @@ cat > "${TMP}/spec.json" <<JSON
   "commands": ["touch /etc/ephemera-customize-test-marker"],
   "ssh_key": "${SSH_KEY_PUB}",
   "copy_in": [{"src": "${COPY_IN_SRC}", "dest": "/etc/ephemera-customize-test-copyfile.txt"}],
-  "enable_services": ["cron"]
+  "enable_services": ["${TEST_SERVICE}"]
 }
 JSON
 
@@ -122,7 +130,8 @@ section "mounting the output image to verify what actually landed on disk"
 NBD_DEV="$(for i in 0 1 2 3 4 5 6 7; do d="/dev/nbd${i}"; [ -e "$d" ] && ! fuser "$d" >/dev/null 2>&1 && echo "$d" && break; done)"
 [ -n "$NBD_DEV" ] || { echo "no free /dev/nbdN device found" >&2; exit 1; }
 qemu-nbd -c "$NBD_DEV" "$OUT_IMAGE"
-sleep 1
+partprobe "$NBD_DEV" 2>/dev/null || true
+udevadm settle --timeout=10 2>/dev/null || sleep 3
 ROOT_PART="$(lsblk -no NAME -l "$NBD_DEV" | grep -v "^$(basename "$NBD_DEV")$" | while read -r p; do
     if mount -o ro "/dev/${p}" "$MOUNT_DIR" 2>/dev/null; then
         if [ -d "${MOUNT_DIR}/etc" ]; then echo "$p"; break; fi
@@ -174,10 +183,10 @@ else
 fi
 
 section "enable_services"
-if [ -L "${MOUNT_DIR}/etc/systemd/system/multi-user.target.wants/cron.service" ]; then
-    pass "cron.service was enabled (multi-user.target.wants symlink present)"
+if [ -L "${MOUNT_DIR}/etc/systemd/system/multi-user.target.wants/${TEST_SERVICE}.service" ]; then
+    pass "${TEST_SERVICE}.service was enabled (multi-user.target.wants symlink present)"
 else
-    fail "cron.service enablement symlink is missing"
+    fail "${TEST_SERVICE}.service enablement symlink is missing"
 fi
 
 section "resolv.conf staging didn't leak into the output image"

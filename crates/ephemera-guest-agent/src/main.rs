@@ -77,6 +77,7 @@ fn run_server(port: u32) -> Result<()> {
         if libc::listen(fd, 16) != 0 {
             anyhow::bail!("listen: {}", std::io::Error::last_os_error());
         }
+        set_cloexec(fd);
         fd
     };
 
@@ -130,6 +131,14 @@ fn handle_connection(file: std::fs::File, expected_token: &Option<String>) -> Re
         }
         AgentRequest::PutFile { path, content_base64, mode } => put_file(&path, &content_base64, mode),
         AgentRequest::GetFile { path } => get_file(&path),
+        AgentRequest::OpenShell { cols, rows } => {
+            // Leftover bytes the BufReader already pulled off the wire past
+            // the request line (the client shouldn't send any before seeing
+            // ShellOpened, but don't drop them silently if it does).
+            let pending = reader.buffer().to_vec();
+            let conn = reader.into_inner();
+            return open_shell(conn, writer, cols, rows, &pending);
+        }
         AgentRequest::Shutdown => {
             writer.write_all(encode_line(&AgentResponse::ShuttingDown)?.as_bytes())?;
             writer.flush()?;
@@ -140,6 +149,159 @@ fn handle_connection(file: std::fs::File, expected_token: &Option<String>) -> Re
 
     writer.write_all(encode_line(&response)?.as_bytes())?;
     writer.flush()?;
+    Ok(())
+}
+
+/// Marks `fd` close-on-exec so a later `fork`+`exec` (spawning the shell,
+/// or any other child) doesn't inherit it. `fork()` copies *every* open fd
+/// in the process by default, not just ones the child logically needs —
+/// without this, the shell child would hold its own open copy of the vsock
+/// connection fd, and the connection would never actually reach EOF even
+/// after every fd this function itself holds is closed, since the kernel
+/// still sees a live reference in the child.
+#[cfg(target_os = "linux")]
+fn set_cloexec(fd: std::os::fd::RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    }
+}
+
+/// Allocates a PTY, spawns `/bin/sh` attached to it as its own session
+/// leader with the slave as controlling terminal (so job control — Ctrl-C,
+/// Ctrl-Z — works normally), acks `ShellOpened`, then relays raw bytes
+/// between `conn`/`writer` (the vsock connection, already split into its
+/// two halves by the caller) and the PTY master until either side closes.
+/// `pending` is forwarded to the shell first — bytes the client already
+/// sent past the request line before this function took over reading.
+#[cfg(target_os = "linux")]
+fn open_shell(
+    mut conn: std::fs::File,
+    mut writer: std::fs::File,
+    cols: u16,
+    rows: u16,
+    pending: &[u8],
+) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    set_cloexec(conn.as_raw_fd());
+    set_cloexec(writer.as_raw_fd());
+
+    let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        writer.write_all(encode_line(&AgentResponse::Error { message: format!("posix_openpt: {err}") })?.as_bytes())?;
+        writer.flush()?;
+        return Ok(());
+    }
+    set_cloexec(master_fd);
+    let setup: Result<std::path::PathBuf> = (|| unsafe {
+        if libc::grantpt(master_fd) != 0 {
+            anyhow::bail!("grantpt: {}", std::io::Error::last_os_error());
+        }
+        if libc::unlockpt(master_fd) != 0 {
+            anyhow::bail!("unlockpt: {}", std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; 256];
+        if libc::ptsname_r(master_fd, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) != 0 {
+            anyhow::bail!("ptsname_r: {}", std::io::Error::last_os_error());
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        buf.truncate(end);
+        Ok(std::path::PathBuf::from(String::from_utf8_lossy(&buf).into_owned()))
+    })();
+    let slave_path = match setup {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe { libc::close(master_fd) };
+            writer.write_all(encode_line(&AgentResponse::Error { message: e.to_string() })?.as_bytes())?;
+            writer.flush()?;
+            return Ok(());
+        }
+    };
+
+    let winsize = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize) };
+
+    let spawn_result = (|| -> Result<std::process::Child> {
+        let slave0 = std::fs::OpenOptions::new().read(true).write(true).open(&slave_path)?;
+        let slave1 = slave0.try_clone()?;
+        let slave2 = slave0.try_clone()?;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.stdin(Stdio::from(slave0)).stdout(Stdio::from(slave1)).stderr(Stdio::from(slave2));
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(cmd.spawn()?)
+    })();
+
+    let mut child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            unsafe { libc::close(master_fd) };
+            writer.write_all(encode_line(&AgentResponse::Error { message: format!("spawning shell: {e}") })?.as_bytes())?;
+            writer.flush()?;
+            return Ok(());
+        }
+    };
+
+    writer.write_all(encode_line(&AgentResponse::ShellOpened)?.as_bytes())?;
+    writer.flush()?;
+
+    let mut master_in = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let mut master_out = master_in.try_clone().context("cloning PTY master fd")?;
+    if !pending.is_empty() {
+        let _ = std::io::Write::write_all(&mut master_in, pending);
+    }
+
+    // conn -> PTY master (client keystrokes into the shell)
+    let to_shell = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match std::io::Read::read(&mut conn, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if std::io::Write::write_all(&mut master_in, &buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+    // PTY master -> conn (shell output to client)
+    let to_client = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match std::io::Read::read(&mut master_out, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if writer.write_all(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+
+    // The session ends when either direction closes (client hung up, or the
+    // shell exited and its PTY slave closed) — don't wait on both, the
+    // still-open side would otherwise block this thread forever on a read
+    // nothing is coming from.
+    loop {
+        if to_shell.is_finished() || to_client.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
     Ok(())
 }
 
@@ -299,5 +461,87 @@ mod tests {
     fn get_file_errors_on_missing_path() {
         let resp = get_file("/nonexistent/path/for/sure");
         assert!(matches!(resp, AgentResponse::Error { .. }));
+    }
+
+    /// A connected AF_UNIX socketpair stands in for the two vsock-connection
+    /// halves `handle_connection` would otherwise split off a real
+    /// `AF_VSOCK` fd — same `std::fs::File`-over-raw-fd shape, so
+    /// `open_shell` runs completely unmodified in this test.
+    fn socketpair() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SOCK_CLOEXEC: this whole test simulates "guest agent" and "vsock
+        // client" as two threads of ONE process (a real deployment has them
+        // as separate processes in separate kernels — host vs. guest — with
+        // no fd table in common at all). Without CLOEXEC here, the client
+        // thread's own end of the pair leaks into every child the agent
+        // thread forks (fork() copies the whole process's fd table, not
+        // just the calling thread's fds), so the agent's read on its own
+        // end never sees EOF even after the client side closes — a
+        // same-process test artifact, not a real cross-VM vsock bug.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed: {}", std::io::Error::last_os_error());
+        unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn open_shell_runs_a_real_pty_shell_round_trip() {
+        let (agent_end, client_end) = socketpair();
+        let agent_end2 = agent_end.try_clone().unwrap();
+
+        let shell = std::thread::spawn(move || {
+            open_shell(agent_end, agent_end2, 80, 24, &[]).unwrap();
+        });
+
+        let mut client_reader = BufReader::new(client_end.try_clone().unwrap());
+        let mut client_writer = client_end;
+
+        // First line back is the ShellOpened ack, still JSON-framed.
+        let mut ack = String::new();
+        client_reader.read_line(&mut ack).unwrap();
+        assert!(ack.contains("shell-opened"), "unexpected ack: {ack:?}");
+
+        // Everything after that is raw PTY bytes — echo a marker and read
+        // until we see it (the shell's own echo of our input, then its
+        // command's output, both arrive on the same raw stream).
+        client_writer.write_all(b"echo PTY_ECHO_TEST_MARKER\n").unwrap();
+        client_writer.flush().unwrap();
+
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let fd = client_reader.get_ref().as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let marker_seen = loop {
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            let mut buf = [0u8; 1024];
+            let r = std::io::Read::read(&mut client_reader, &mut buf);
+            match r {
+                Ok(0) => break false,
+                Ok(n) => {
+                    seen.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&seen).contains("PTY_ECHO_TEST_MARKER") {
+                        break true;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break false,
+            }
+        };
+        assert!(marker_seen, "never saw the marker in PTY output; got: {:?}", String::from_utf8_lossy(&seen));
+
+        // Both ends must close for the peer to see EOF — client_reader
+        // holds a dup'd fd of the same socket, so dropping client_writer
+        // alone leaves the connection open from the agent's point of view.
+        drop(client_writer);
+        drop(client_reader);
+        shell.join().unwrap();
     }
 }

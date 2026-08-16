@@ -52,8 +52,23 @@ pub enum AgentRequest {
     /// Read `path` from inside the guest, returned base64-encoded in
     /// [`AgentResponse::FileContent`]. Replaces machinectl's `copy-from`.
     GetFile { path: String },
+    /// Open an interactive PTY-backed shell. Unlike every other request,
+    /// this is the *last* JSON line the agent reads on this connection —
+    /// once it answers [`AgentResponse::ShellOpened`], the connection stops
+    /// being newline-JSON-framed entirely and becomes a raw byte pipe
+    /// wired straight to the shell's PTY until either side closes it.
+    /// Terminal resize isn't supported (no control channel once the
+    /// connection goes raw) — the PTY is sized once at open time.
+    OpenShell {
+        #[serde(default = "default_pty_cols")]
+        cols: u16,
+        #[serde(default = "default_pty_rows")]
+        rows: u16,
+    },
     Shutdown,
 }
+fn default_pty_cols() -> u16 { 80 }
+fn default_pty_rows() -> u16 { 24 }
 
 /// Every request the agent authored by `ephemera-vsock-client` is wrapped in
 /// this envelope. `token` is checked against the file at [`TOKEN_FILE_PATH`]
@@ -110,6 +125,10 @@ pub enum AgentResponse {
         /// Unix permission bits the file had on the guest, e.g. `0o644`.
         mode: u32,
     },
+    /// Acknowledges `AgentRequest::OpenShell` — the last framed message on
+    /// this connection; every byte after this response's trailing `\n` is
+    /// raw PTY traffic, not JSON.
+    ShellOpened,
     ShuttingDown,
     Error {
         message: String,
@@ -196,5 +215,26 @@ mod tests {
         assert!(line.contains("\"result\":\"file-content\""));
         let back: AgentResponse = decode_line(&line).unwrap();
         assert!(matches!(back, AgentResponse::FileContent { mode: 0o600, .. }));
+    }
+
+    #[test]
+    fn open_shell_defaults_cols_and_rows_when_omitted() {
+        let line = "{\"op\":\"open-shell\"}\n";
+        let req: AgentRequest = decode_line(line).unwrap();
+        match req {
+            AgentRequest::OpenShell { cols, rows } => {
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let explicit = AgentRequest::OpenShell { cols: 120, rows: 40 };
+        let line = encode_line(&explicit).unwrap();
+        assert!(line.contains("\"cols\":120"));
+        assert!(line.contains("\"rows\":40"));
+
+        let opened = encode_line(&AgentResponse::ShellOpened).unwrap();
+        assert!(opened.contains("\"result\":\"shell-opened\""));
     }
 }

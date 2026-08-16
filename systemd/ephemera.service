@@ -19,6 +19,10 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+# guestkit (disk customization/agent-token injection) needs a scratch mount
+# root under /run or /tmp; PrivateTmp gives it an isolated, writable /tmp
+# without opening up the host's shared one.
+PrivateTmp=true
 ReadWritePaths=/var/lib/ephemera /run/ephemera /var/lock
 
 [Install]

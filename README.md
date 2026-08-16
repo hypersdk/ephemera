@@ -415,6 +415,27 @@ Cloud Hypervisor VM's vsock connection *did* survive the identical pause/resume/
 the same client code, so this looks like a Firecracker vsock characteristic rather than an ephemera
 bug, but it's not something this project has a fix for.
 
+**Interactive console:** `GET /v1/vms/{id}/console?cols=&rows=` upgrades to a WebSocket relayed
+end-to-end to a real PTY-backed `/bin/sh` in the guest over the same vsock agent connection as
+`exec` (see `ephemera_vsock_client::open_shell`) — real keystrokes, real job control, verified live
+against a real QEMU VM (connect, `echo` a marker string, see it echoed back through the PTY).
+
+**Known issue, not yet fixed:** after one console session ends, the guest agent's vsock listener on
+that VM stops accepting new connections — a second `exec`/console/file-copy call to the same VM then
+fails with a raw `Connection reset by peer`, even though the guest kernel itself is still alive and
+making progress (confirmed by watching its boot log continue in parallel). Isolated live to
+`ephemera-guest-agent`'s `open_shell()`: `child.kill()`/`.wait()`/`.try_wait()`, called from the same
+thread that earlier did `posix_openpt`/`grantpt`/spawned the shell, block indefinitely — a brand-new
+thread doing the identical calls does not. The current code hands reaping off to a detached thread so
+a session ending can't wedge the connection handler itself, but that only stops this one thread from
+hanging — it does not explain, or fix, why the *listener* goes unreachable afterward. Because of this,
+`zyvor-fabric`'s Ephemera driver does not request `agent.enabled: true` by default yet (see its own
+`docs/guides/vm-drivers/ephemera.md`) — flipping that on before this is root-caused would break
+`exec`/file-copy on any VM a user opened a console session on. Reproduce with a raw two-line vsock
+probe (connect, send an `OpenShell` request, read the `ShellOpened` ack, disconnect) followed by an
+`exec` call to the same VM; a debugger/strace session on the guest, not a black-box test over vsock,
+is very likely what it'll take to find the actual cause.
+
 ## Resource control (cgroup v2)
 
 Every VM (all three backends) is migrated into its own `ephemera.slice/{id}.scope` cgroup right after

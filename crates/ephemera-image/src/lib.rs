@@ -335,6 +335,10 @@ fn inject_guest_agent_token_blocking(disk: &Path, token: &str) -> Result<()> {
     use guestkit::Guestfs;
 
     let mut g = Guestfs::new().context("creating guestfs handle")?;
+    if std::env::var("GUESTKIT_DEBUG").is_ok() {
+        g.set_debug(true);
+        g.set_trace(true);
+    }
     g.add_drive(disk).with_context(|| format!("adding drive {}", disk.display()))?;
     g.launch().context("launching guestfs")?;
 

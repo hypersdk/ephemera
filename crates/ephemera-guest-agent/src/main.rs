@@ -227,17 +227,29 @@ fn open_shell(
         let slave0 = std::fs::OpenOptions::new().read(true).write(true).open(&slave_path)?;
         let slave1 = slave0.try_clone()?;
         let slave2 = slave0.try_clone()?;
+        // `TIOCSCTTY` on an *inherited* PTY fd can fail EPERM in some
+        // guest-kernel/PTY-allocation states even from a fresh session
+        // leader — found live: `setsid()` succeeds, the ioctl still
+        // returns EPERM. POSIX guarantees a *fresh open* of a terminal by
+        // a session leader with no controlling terminal yet acquires one
+        // automatically, no ioctl needed — re-opening the slave from
+        // *inside* the child (after setsid, before exec) side-steps
+        // whatever inherited-fd state trips up the ioctl path.
+        let slave_path_c = std::ffi::CString::new(slave_path.as_os_str().as_encoded_bytes())
+            .context("slave PTY path contains a NUL byte")?;
         let mut cmd = Command::new("/bin/sh");
         cmd.stdin(Stdio::from(slave0)).stdout(Stdio::from(slave1)).stderr(Stdio::from(slave2));
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                let ctty_fd = libc::open(slave_path_c.as_ptr(), libc::O_RDWR);
+                if ctty_fd < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                libc::close(ctty_fd);
                 Ok(())
             });
         }
@@ -263,7 +275,19 @@ fn open_shell(
         let _ = std::io::Write::write_all(&mut master_in, pending);
     }
 
+    // Either relay direction finishing signals the session is over (client
+    // hung up, or the shell exited and its PTY slave closed) — a channel
+    // both threads share the sender end of lets the main thread block on
+    // the first one to finish. (Not `JoinHandle::is_finished()` polling:
+    // found live, under real vsock/PTY load, that a poll loop checking
+    // `is_finished()` right after both threads had provably already
+    // returned never observed it and spun forever — root cause not
+    // identified; recv() on a channel each thread explicitly signals into
+    // sidesteps whatever that was and is more idiomatic anyway.)
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
     // conn -> PTY master (client keystrokes into the shell)
+    let to_shell_tx = done_tx.clone();
     let to_shell = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -275,8 +299,10 @@ fn open_shell(
                 break;
             }
         }
+        let _ = to_shell_tx.send(());
     });
     // PTY master -> conn (shell output to client)
+    let to_client_tx = done_tx.clone();
     let to_client = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -288,20 +314,29 @@ fn open_shell(
                 break;
             }
         }
+        let _ = to_client_tx.send(());
     });
+    drop(done_tx);
+    let _ = done_rx.recv();
 
-    // The session ends when either direction closes (client hung up, or the
-    // shell exited and its PTY slave closed) — don't wait on both, the
-    // still-open side would otherwise block this thread forever on a read
-    // nothing is coming from.
-    loop {
-        if to_shell.is_finished() || to_client.is_finished() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    // Kill/reap on a detached thread, not here: found live that
+    // `child.kill()`/`.wait()`/`.try_wait()` called from *this* thread
+    // (which had earlier done the posix_openpt/grantpt/spawn calls above)
+    // block indefinitely under real vsock/PTY load in a way a brand-new
+    // thread doing the identical calls does not — root cause not
+    // identified. This keeps a session ending from ever wedging the
+    // connection handler even though it doesn't explain the underlying
+    // hang; see the Ephemera README's known-issues section.
+    std::thread::spawn(move || {
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    // Don't join to_shell/to_client either: whichever side didn't finish
+    // is still blocked on its own read (the peer hasn't closed that half
+    // yet) — it'll unblock and exit on its own once `conn`/the PTY master
+    // actually close.
+    drop(to_shell);
+    drop(to_client);
     Ok(())
 }
 

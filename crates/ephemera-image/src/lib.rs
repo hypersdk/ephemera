@@ -31,17 +31,15 @@ pub struct BuildImageRequest {
     pub commands: Vec<String>,
     #[serde(default)]
     pub ssh_key: Option<String>,
-    /// Files to place directly into the image before any virt-customize
-    /// step runs (e.g. a compiled `ephemera-guest-agent` binary and its
-    /// systemd unit). Applied via `guestkit` — a host-side file's
-    /// permission bits are preserved on copy, so a binary already marked
-    /// executable stays executable; no separate chmod step is needed.
+    /// Files to place directly into the image (e.g. a compiled
+    /// `ephemera-guest-agent` binary and its systemd unit). Applied via
+    /// `guestkit` — a host-side file's permission bits are preserved on
+    /// copy, so a binary already marked executable stays executable; no
+    /// separate chmod step is needed.
     #[serde(default)]
     pub copy_in: Vec<CopyIn>,
     /// systemd unit names to `systemctl enable` via guestkit's chroot
-    /// command exec, in the same session as `copy_in` — independent of
-    /// virt-customize, whose libguestfs appliance needs outbound networking
-    /// (via `passt`) that isn't available/working on every host.
+    /// command exec, in the same session as every other customization step.
     #[serde(default)]
     pub enable_services: Vec<String>,
 }
@@ -96,43 +94,34 @@ pub async fn build_image(cfg: &Config, req: &BuildImageRequest) -> Result<BuildI
         ]).await?;
     }
 
-    if !req.copy_in.is_empty() || !req.enable_services.is_empty() {
-        inject_files(&req.output, req.copy_in.clone(), req.enable_services.clone()).await?;
-    }
-
-    if req.hostname.is_some() || !req.packages.is_empty() || !req.commands.is_empty() || req.ssh_key.is_some() {
-        let mut a = vec!["-a".into(), req.output.display().to_string()];
-        if let Some(h) = &req.hostname { a.extend(["--hostname".into(), h.clone()]); }
-        if !req.packages.is_empty() { a.extend(["--install".into(), req.packages.join(",")]); }
-        for c in &req.commands { a.extend(["--run-command".into(), c.clone()]); }
-        if let Some(key) = &req.ssh_key {
-            let key_file = req.output.with_extension("builder.pub");
-            fs::write(&key_file, key).context("writing temporary ssh key")?;
-            a.extend(["--ssh-inject".into(), format!("root:file:{}", key_file.display())]);
-            let result = run_checked(&cfg.virt_customize_binary, &a).await;
-            let _ = fs::remove_file(key_file);
-            result?;
-        } else {
-            run_checked(&cfg.virt_customize_binary, &a).await?;
-        }
+    let needs_customize = !req.copy_in.is_empty() || !req.enable_services.is_empty()
+        || req.hostname.is_some() || !req.packages.is_empty() || !req.commands.is_empty() || req.ssh_key.is_some();
+    if needs_customize {
+        customize_image(req.output.clone(), req.clone()).await?;
     }
     Ok(BuildImageResult { output: req.output.clone(), format: req.format.clone() })
 }
 
-/// Copies `files` into `image` and `systemctl enable`s `services`, via
-/// `guestkit` (qemu-nbd mount + chroot — no libguestfs appliance, so this
-/// works even where `virt-customize`'s network-capable appliance doesn't;
-/// see the doc comment on `enable_services`). `Guestfs`'s methods are
+/// Applies every customization field on `req` (`copy_in`, `enable_services`,
+/// `hostname`, `packages`, `commands`, `ssh_key`) in one `guestkit` session —
+/// qemu-nbd mount + chroot, no libguestfs appliance. `Guestfs`'s methods are
 /// synchronous/blocking, so this runs on a blocking-pool thread rather than
-/// stalling the async runtime for however long the mount+copy takes.
-async fn inject_files(image: &Path, files: Vec<CopyIn>, services: Vec<String>) -> Result<()> {
-    let image = image.to_path_buf();
-    tokio::task::spawn_blocking(move || inject_files_blocking(&image, &files, &services))
+/// stalling the async runtime for however long the mount+customize takes.
+///
+/// **Known limitation**: `guestkit::Guestfs::command` chroots without
+/// bind-mounting `/proc`, `/sys`, or `/dev` from the host first (unlike a
+/// real booted appliance). Simple packages install fine; a package whose
+/// postinst script depends on `/proc` (common for kernel/systemd-adjacent
+/// packages) can fail here where a full-appliance tool wouldn't. No
+/// workaround today beyond passing an equivalent `commands` entry that
+/// bind-mounts what a specific package needs before installing it.
+async fn customize_image(image: PathBuf, req: BuildImageRequest) -> Result<()> {
+    tokio::task::spawn_blocking(move || customize_image_blocking(&image, &req))
         .await
         .context("guestkit worker thread panicked")?
 }
 
-fn inject_files_blocking(image: &Path, files: &[CopyIn], services: &[String]) -> Result<()> {
+fn customize_image_blocking(image: &Path, req: &BuildImageRequest) -> Result<()> {
     use guestkit::Guestfs;
 
     let mut g = Guestfs::new().context("creating guestfs handle")?;
@@ -140,25 +129,137 @@ fn inject_files_blocking(image: &Path, files: &[CopyIn], services: &[String]) ->
     g.launch().context("launching guestfs")?;
 
     let roots = g.inspect_os().context("inspecting guest OS")?;
-    let root = roots.first().context("no operating system found in image")?;
-    let mounts = g.inspect_get_mountpoints(root).context("getting mountpoints")?;
+    let root = roots.first().context("no operating system found in image")?.clone();
+    let mounts = g.inspect_get_mountpoints(&root).context("getting mountpoints")?;
     for (mountpoint, device) in &mounts {
         g.mount(device, mountpoint)
             .with_context(|| format!("mounting {device} at {mountpoint}"))?;
     }
 
-    for file in files {
+    for file in &req.copy_in {
         let src = file.src.to_str().context("copy_in src path is not valid UTF-8")?;
         g.upload(src, &file.dest)
             .with_context(|| format!("copying {} to {} in image", file.src.display(), file.dest))?;
     }
-    for service in services {
+
+    if let Some(hostname) = &req.hostname {
+        g.write("/etc/hostname", format!("{hostname}\n").as_bytes())
+            .context("writing /etc/hostname")?;
+    }
+
+    if !req.packages.is_empty() {
+        install_packages_with_dns(&mut g, &req.packages)?;
+    }
+
+    for cmd in &req.commands {
+        g.sh_raw(cmd).with_context(|| format!("running command: {cmd}"))?;
+    }
+
+    for service in &req.enable_services {
         g.command(&["systemctl", "enable", service])
             .with_context(|| format!("enabling {service}"))?;
     }
 
+    if let Some(key) = &req.ssh_key {
+        inject_ssh_key(&mut g, key)?;
+    }
+
     let _ = g.umount_all();
     g.shutdown().context("shutting down guestfs")?;
+    Ok(())
+}
+
+/// Installs `packages`, temporarily staging the host's `/etc/resolv.conf`
+/// into the guest first. `guestkit`'s chroot exec (see [`install_packages`])
+/// runs in the host's network namespace, but every package manager still
+/// resolves hostnames using the *guest's own* `/etc/resolv.conf` — and on a
+/// stock cloud image that's a symlink to `/run/systemd/resolve/...`, which
+/// doesn't exist outside a running systemd instance. Without a real
+/// `/etc/resolv.conf` in place, every fetch fails with "Temporary failure
+/// resolving" (confirmed against a real Ubuntu 24.04 image) even though
+/// networking itself works fine. The staged file is removed afterward
+/// (restored, if the guest had a real, non-symlink one of its own) — cloud
+/// images regenerate their own resolver config on first boot regardless.
+fn install_packages_with_dns(g: &mut guestkit::Guestfs, packages: &[String]) -> Result<()> {
+    let original = g.read_file("/etc/resolv.conf").ok();
+    let host_resolv = fs::read("/etc/resolv.conf").context("reading host /etc/resolv.conf")?;
+    // A stock cloud image's /etc/resolv.conf is typically a *dangling*
+    // symlink (e.g. to /run/systemd/resolve/stub-resolv.conf, which doesn't
+    // exist outside a running systemd instance). `Guestfs::rm`/`write`
+    // resolve the guest path to a host path but then use plain `fs`
+    // calls, which follow symlinks — for a dangling one that means ENOENT,
+    // and for a non-dangling absolute-target one it would mean writing
+    // through the raw target path on the *host*, escaping the mount
+    // entirely. Removing it via a chroot `rm -f` first sidesteps both: the
+    // chroot resolves the path against the guest root, not the host's.
+    let _ = g.command(&["rm", "-f", "/etc/resolv.conf"]);
+    g.write("/etc/resolv.conf", &host_resolv).context("staging /etc/resolv.conf for package install")?;
+
+    let result = install_packages(g, packages);
+
+    let _ = g.command(&["rm", "-f", "/etc/resolv.conf"]);
+    match &original {
+        Some(bytes) => { let _ = g.write("/etc/resolv.conf", bytes); }
+        None => {}
+    }
+    result
+}
+
+/// Installs `packages` via the guest's own package manager. The manager is
+/// detected by actually exec'ing `command -v <tool>` inside the chroot
+/// (`apt-get`/`tdnf`/`dnf`/`yum`/`pacman`, checked in that order) rather
+/// than via `guestkit`'s `inspect_get_package_management`, whose
+/// presence-check constructs `<root>/usr/bin/<tool>` from the abstract
+/// device-rooted `root` identifier `inspect_os` returns — that string isn't
+/// a real filesystem path, so the check always misses even when the binary
+/// is genuinely installed (confirmed against a real Ubuntu 24.04 image,
+/// which has `/usr/bin/apt` but was reported as `dpkg`). Exec'ing inside
+/// the chroot sidesteps that bug entirely.
+fn install_packages(g: &mut guestkit::Guestfs, packages: &[String]) -> Result<()> {
+    let pkgs: Vec<&str> = packages.iter().map(String::as_str).collect();
+    let tool = ["apt-get", "tdnf", "dnf", "yum", "pacman"].into_iter().find(|tool| {
+        g.command(&["sh", "-c", &format!("command -v {tool}")])
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(false)
+    });
+    match tool {
+        Some("apt-get") => {
+            g.command(&["apt-get", "update"]).context("apt-get update")?;
+            let mut args = vec!["apt-get", "install", "-y"];
+            args.extend(pkgs);
+            g.command(&args).context("apt-get install")?;
+        }
+        Some(t @ ("tdnf" | "dnf" | "yum")) => {
+            let mut args = vec![t, "install", "-y"];
+            args.extend(pkgs);
+            g.command(&args).context("package install")?;
+        }
+        Some("pacman") => {
+            let mut args = vec!["pacman", "-Sy", "--noconfirm"];
+            args.extend(pkgs);
+            g.command(&args).context("pacman install")?;
+        }
+        _ => bail!(
+            "cannot install packages: no supported package manager found in the guest \
+             (checked apt-get/tdnf/dnf/yum/pacman) — install them via an equivalent \
+             `commands` entry instead"
+        ),
+    }
+    Ok(())
+}
+
+/// Authorizes `key` for root login by appending it to
+/// `/root/.ssh/authorized_keys`, creating the file/directory if needed.
+/// Matches the prior `virt-customize --ssh-inject root:file:...` behavior.
+fn inject_ssh_key(g: &mut guestkit::Guestfs, key: &str) -> Result<()> {
+    g.command(&["mkdir", "-p", "/root/.ssh"]).context("creating /root/.ssh")?;
+    g.command(&["chmod", "700", "/root/.ssh"]).context("chmod /root/.ssh")?;
+    let mut content = g.command(&["cat", "/root/.ssh/authorized_keys"]).unwrap_or_default();
+    if !content.is_empty() && !content.ends_with('\n') { content.push('\n'); }
+    content.push_str(key.trim());
+    content.push('\n');
+    g.write("/root/.ssh/authorized_keys", content.as_bytes()).context("writing authorized_keys")?;
+    g.command(&["chmod", "600", "/root/.ssh/authorized_keys"]).context("chmod authorized_keys")?;
     Ok(())
 }
 

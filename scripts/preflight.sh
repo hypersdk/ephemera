@@ -5,7 +5,7 @@
 set -euo pipefail
 
 missing=0
-for cmd in qemu-system-x86_64 qemu-img cloud-localds virt-customize ip; do
+for cmd in qemu-system-x86_64 qemu-img cloud-localds ip; do
   if command -v "$cmd" >/dev/null 2>&1; then
     printf '%-24s %s\n' "$cmd" "OK ($(command -v "$cmd"))"
   else

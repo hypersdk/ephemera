@@ -45,7 +45,7 @@ Usage:
   $0 user@host [options]
 
 Profiles:
-  (default)     Full remote build + system deps (qemu, cloud-utils, libguestfs)
+  (default)     Full remote build + system deps (qemu, cloud-utils)
   --quick       Rsync + cargo build on remote (skip dep install)
   --quick --build-local   Install locally built target/release/ephemera (Linux only)
 
@@ -337,13 +337,17 @@ fi
 
 if [ "$PKG" = "apt-get" ]; then
     $SUDO apt-get install -y -qq \
-        qemu-system-x86 qemu-utils cloud-image-utils libguestfs-tools \
+        qemu-system-x86 qemu-utils cloud-image-utils \
         iproute2 build-essential pkg-config curl git
 else
     $SUDO "$PKG" install -y \
-        qemu-kvm qemu-img cloud-utils libguestfs-tools-c \
+        qemu-kvm qemu-img cloud-utils \
         iproute gcc make openssl-devel pkg-config curl git
 fi
+
+# guestkit (used by `ephemera build-image`'s image customization) mounts
+# qcow2/raw images via qemu-nbd, which needs the nbd kernel module loaded.
+$SUDO modprobe nbd max_part=16 2>/dev/null || echo "WARN: modprobe nbd failed — image customization will not work until the nbd module is loaded" >&2
 
 echo "System dependencies installed"
 REMOTE

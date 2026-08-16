@@ -7,7 +7,7 @@ Firecracker, Cloud Hypervisor, and QEMU/KVM from one Rust-native control plane.
 - **Cloud Hypervisor** — Rust VMM for modern cloud workloads, direct-kernel or firmware boot.
 - **Firecracker** — microVM backend using a Linux kernel + raw root filesystem.
 
-It also contains a small **virt-builder-style image pipeline**: use a local/HTTP base image, verify SHA-256, convert/resize it, and customize it with `virt-customize`.
+It also contains a small **virt-builder-style image pipeline**: use a local/HTTP base image, verify SHA-256, convert/resize it, and customize it before first boot.
 
 Beyond a single host: a `DisposableVm` Kubernetes CRD + node-local operator (`ephemera-kube`), and a
 non-Kubernetes distributed node-agent (`ephemera-agent`) with a central fleet registry and load-aware
@@ -35,7 +35,7 @@ placement across multiple hosts — see "Kubernetes CRD/operator" and "Distribut
               KVM + TAP/bridge + Linux host
 
 Image path:
-base image -> SHA256 -> qemu-img -> virt-customize -> reusable template
+base image -> SHA256 -> qemu-img -> customize -> reusable template
                                       |
 VM launch: template -> disposable clone -> cloud-init -> VMM -> TTL delete
 ```
@@ -71,8 +71,7 @@ and "Kubernetes CRD/operator" below.
 
 This project also depends on the sibling [`guestkit`](../guestkit) project (a
 pure-Rust, qemu-nbd-based disk toolkit) as a path dependency from `ephemera-image`,
-for injecting files into an offline image without needing libguestfs/`virt-customize`
-for that step — see "Build an image" below.
+for injecting files into an offline image — see "Build an image" below.
 
 ## What is implemented
 
@@ -98,7 +97,7 @@ for that step — see "Build an image" below.
 - Console log path per VM.
 - Control sockets: QMP, Cloud Hypervisor API socket, Firecracker API socket.
 - Image download/cache + SHA-256 verification.
-- `virt-customize` package/hostname/command/SSH-key customization, plus `guestkit`-based `copy_in`/`enable_services` for injecting files (e.g. the guest agent binary) and enabling systemd units without needing a network-capable libguestfs appliance.
+- Image build customization, all via `guestkit` (no libguestfs appliance): package install, hostname, arbitrary commands, SSH-key injection, `copy_in` for injecting files (e.g. the guest agent binary), and `enable_services` for enabling systemd units.
 - systemd units and one-command host bootstrap (installs QEMU tooling, Cloud Hypervisor, and Firecracker).
 - SSH/rsync remote deploy script with full and quick profiles.
 - End-to-end networking smoke test (QEMU user-mode NAT, TAP+bridge+DHCP, and macvtap, all SSH-verified).
@@ -116,7 +115,6 @@ Typical packages/tools:
 qemu-system-x86_64
 qemu-img
 cloud-localds
-virt-customize
 ip
 cp
 ```
@@ -130,8 +128,9 @@ For Firecracker, provide a compatible uncompressed guest kernel (`vmlinux`) and 
 ## Prepare host (one command)
 
 On a fresh Linux box, this installs the system packages (`qemu-system-x86_64`, `qemu-img`,
-`cloud-localds`, `virt-customize`), Cloud Hypervisor, Firecracker, and Rust Hypervisor Firmware,
-then creates the state directories and an optional bridge:
+`cloud-localds`), Cloud Hypervisor, Firecracker, and Rust Hypervisor Firmware, loads the `nbd`
+kernel module (needed by `guestkit` for image customization), then creates the state directories
+and an optional bridge:
 
 ```bash
 sudo ./scripts/bootstrap-host.sh vmbr0
@@ -531,9 +530,13 @@ Example request:
 }
 ```
 
-`copy_in` places files directly into the image (via `guestkit`, before `virt-customize` runs) and
-`enable_services` runs `systemctl enable` for each named unit — both independent of `virt-customize`'s
-appliance, which needs outbound networking (`passt`) that isn't guaranteed to work on every host.
+`copy_in` places files directly into the image and `enable_services` runs `systemctl enable` for
+each named unit — both, like every other customization field, done via `guestkit` mounting the
+image directly with `qemu-nbd` (no libguestfs appliance). Neither needs outbound networking; the
+`packages` field does — it runs the guest's own package manager (`apt`/`dnf`/`tdnf`/`yum`/`pacman`,
+auto-detected) inside a chroot, temporarily staging the host's `/etc/resolv.conf` into the guest for
+DNS resolution (a stock cloud image's own `/etc/resolv.conf` is normally a dangling symlink that
+only resolves under a running systemd instance) and removing it again once installs finish.
 This is how the guest agent gets baked into an image:
 
 ```json

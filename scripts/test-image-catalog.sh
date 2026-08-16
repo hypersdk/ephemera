@@ -116,7 +116,6 @@ qemu_img_binary = "qemu-img"
 cloud_hypervisor_binary = "cloud-hypervisor"
 ch_remote_binary = "ch-remote"
 cloud_localds_binary = "cloud-localds"
-virt_customize_binary = "virt-customize"
 firecracker_binary = "firecracker"
 default_bridge = "vmbr0"
 reaper_interval_secs = 5

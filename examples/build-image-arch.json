@@ -1,0 +1,9 @@
+{
+  "source": "/var/lib/ephemera/images/arch.qcow2",
+  "output": "/var/lib/ephemera/images/arch-dev.qcow2",
+  "format": "qcow2",
+  "hostname": "arch-dev",
+  "packages": ["tree", "jq"],
+  "commands": ["touch /etc/provisioned-by-ephemera"],
+  "enable_services": ["sshd"]
+}

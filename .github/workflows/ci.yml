@@ -52,3 +52,76 @@ jobs:
       - name: cargo clippy (informational — not a merge gate yet)
         working-directory: ephemera
         run: cargo clippy --workspace --all-targets || true
+
+  # Real-hardware regression test for `ephemera build-image`'s guestkit-based
+  # customization path (see scripts/test-image-customize.sh) across every
+  # package-manager branch install_packages() supports. Doesn't need KVM —
+  # build-image never boots a VM, it mounts the image directly via
+  # guestkit's qemu-nbd + chroot — so this runs on stock GitHub-hosted
+  # runners with no nested-virtualization dependency.
+  image-customize:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu
+            image_url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+            test_service: cron
+          - distro: rocky
+            image_url: https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2
+            test_service: crond
+          - distro: arch
+            image_url: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+            test_service: sshd
+    steps:
+      - name: Checkout ephemera
+        uses: actions/checkout@v4
+        with:
+          path: ephemera
+
+      - name: Checkout guestkit (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: hypersdk/guestkit
+          path: guestkit
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libsystemd-dev qemu-utils parted
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ephemera
+          key: image-customize-${{ matrix.distro }}
+
+      - name: Build ephemera-cli + ephemera-image (release)
+        working-directory: ephemera
+        run: cargo build --release -p ephemera-cli -p ephemera-image
+
+      # Base cloud images are 500MB+ and rarely change — cache by URL so
+      # only the first run per distro per cache-eviction cycle pays for it.
+      - name: Cache base image
+        id: cache-image
+        uses: actions/cache@v4
+        with:
+          path: /tmp/base-image.qcow2
+          key: image-customize-base-${{ matrix.distro }}-${{ matrix.image_url }}
+
+      - name: Download base image
+        if: steps.cache-image.outputs.cache-hit != 'true'
+        run: curl -sSL --retry 3 --retry-delay 5 -o /tmp/base-image.qcow2 "${{ matrix.image_url }}"
+
+      - name: modprobe nbd
+        run: sudo modprobe nbd max_part=16
+
+      - name: Run test-image-customize.sh
+        working-directory: ephemera
+        env:
+          EPHEMERA_BIN: ${{ github.workspace }}/ephemera/target/release/ephemera
+          TEST_PACKAGE: tree
+          TEST_SERVICE: ${{ matrix.test_service }}
+        run: sudo -E ./scripts/test-image-customize.sh --image /tmp/base-image.qcow2

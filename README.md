@@ -15,6 +15,8 @@ placement across multiple hosts — see "Kubernetes CRD/operator" and "Distribut
 
 > This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC, the Firecracker jailer (chroot + uid/gid isolation), cgroup v2 resource control, and per-VM network namespaces are already implemented (see "Auth / RBAC", "Firecracker jailer", "Resource control (cgroup v2)", and "Network namespaces" below) — before exposing it to untrusted tenants, still add seccomp/AppArmor/SELinux policy, quotas, audit logging and stronger image provenance.
 
+See [`docs/use-cases.md`](docs/use-cases.md) for concrete use cases — ephemeral CI runners, a golden-image pipeline, Kubernetes-native disposable workloads, multi-host fleets without Kubernetes, and sandboxed code execution — each grounded in what's actually implemented below.
+
 ## Architecture
 
 ```text
@@ -551,6 +553,13 @@ This is how the guest agent gets baked into an image:
   "enable_services": ["ephemera-guest-agent"]
 }
 ```
+
+`packages` installs through whichever package manager `install_packages` actually finds inside the
+guest (`apt-get`/`tdnf`/`dnf`/`yum`/`pacman`, checked in that order) — see
+[`docs/build-image-tutorials.md`](docs/build-image-tutorials.md) for a full, real-hardware-verified
+walkthrough per distro family (Debian/Ubuntu, RHEL-family, Arch Linux), including the two things
+Arch specifically needs (empty keyring, missing `/etc/mtab`) that `build-image` handles for you
+automatically.
 
 ## Image catalog & signing
 

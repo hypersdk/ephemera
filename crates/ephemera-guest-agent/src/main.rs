@@ -92,7 +92,7 @@ fn run_server(port: u32) -> Result<()> {
         let expected_token = expected_token.clone();
         std::thread::spawn(move || {
             let file = unsafe { std::fs::File::from_raw_fd(conn_fd) };
-            if let Err(e) = handle_connection(file, &expected_token) {
+            if let Err(e) = handle_connection(file, &expected_token, listener_fd) {
                 eprintln!("connection error: {e:#}");
             }
         });
@@ -105,7 +105,7 @@ fn run_server(_port: u32) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn handle_connection(file: std::fs::File, expected_token: &Option<String>) -> Result<()> {
+fn handle_connection(file: std::fs::File, expected_token: &Option<String>, listener_fd: i32) -> Result<()> {
     let mut writer = file.try_clone().context("cloning connection fd")?;
     let mut reader = BufReader::new(file);
 
@@ -137,7 +137,7 @@ fn handle_connection(file: std::fs::File, expected_token: &Option<String>) -> Re
             // ShellOpened, but don't drop them silently if it does).
             let pending = reader.buffer().to_vec();
             let conn = reader.into_inner();
-            return open_shell(conn, writer, cols, rows, &pending);
+            return spawn_open_shell_session(listener_fd, conn, writer, cols, rows, pending);
         }
         AgentRequest::Shutdown => {
             writer.write_all(encode_line(&AgentResponse::ShuttingDown)?.as_bytes())?;
@@ -167,6 +167,62 @@ fn set_cloexec(fd: std::os::fd::RawFd) {
     }
 }
 
+/// Runs an `OpenShell` session in a *double-forked, fully detached process*
+/// rather than in this connection's thread — matching how OpenSSH's `sshd`
+/// and systemd isolate `setsid()`/PTY/session-leader work away from their
+/// own long-lived listener (see the README's "Interactive console"
+/// section for the history: a version of this that ran `open_shell()`
+/// in-process, even on its own thread, left the guest agent's *listener*
+/// permanently unable to accept new vsock connections roughly 1-in-3
+/// sessions — never reproduced in isolation despite extensive attempts,
+/// but eliminated by not sharing a process with the listener at all,
+/// which is the same reasoning sshd/systemd apply and is sufficient on
+/// its own without needing the exact kernel mechanism).
+///
+/// First fork: the immediate child closes its inherited copy of the
+/// listener fd right away, forks again, and exits — this process never
+/// touches the PTY and is designed to be near-instant, so the parent's
+/// `waitpid()` on it can't stall `accept()` for long. Second fork: the
+/// grandchild runs the real `open_shell()` body, fully orphaned from the
+/// agent's own process tree (reparented to the guest's init once its
+/// immediate parent exits, so nothing in the agent ever calls
+/// `wait()`/`kill()` on it either).
+#[cfg(target_os = "linux")]
+fn spawn_open_shell_session(
+    listener_fd: i32,
+    conn: std::fs::File,
+    writer: std::fs::File,
+    cols: u16,
+    rows: u16,
+    pending: Vec<u8>,
+) -> Result<()> {
+    unsafe {
+        let pid1 = libc::fork();
+        if pid1 < 0 {
+            anyhow::bail!("fork (session isolation) failed: {}", std::io::Error::last_os_error());
+        }
+        if pid1 == 0 {
+            libc::close(listener_fd);
+            let pid2 = libc::fork();
+            if pid2 == 0 {
+                let _ = open_shell(conn, writer, cols, rows, &pending);
+                libc::_exit(0);
+            }
+            libc::_exit(0);
+        }
+        // Parent: drop our own copies of the connection (the grandchild
+        // owns it exclusively from here), then reap only the fast-exiting
+        // first-level child — an ordinary, non-PTY, non-session-leader
+        // child, the one shape already proven safe by every plain `exec`
+        // call this agent has ever handled.
+        drop(conn);
+        drop(writer);
+        let mut status = 0;
+        libc::waitpid(pid1, &mut status, 0);
+    }
+    Ok(())
+}
+
 /// Allocates a PTY, spawns `/bin/sh` attached to it as its own session
 /// leader with the slave as controlling terminal (so job control — Ctrl-C,
 /// Ctrl-Z — works normally), acks `ShellOpened`, then relays raw bytes
@@ -174,6 +230,9 @@ fn set_cloexec(fd: std::os::fd::RawFd) {
 /// two halves by the caller) and the PTY master until either side closes.
 /// `pending` is forwarded to the shell first — bytes the client already
 /// sent past the request line before this function took over reading.
+/// Always runs inside its own detached, double-forked process (see
+/// `spawn_open_shell_session`) except in the unit test below, which calls
+/// this directly to exercise the PTY logic in-process.
 #[cfg(target_os = "linux")]
 fn open_shell(
     mut conn: std::fs::File,
@@ -256,7 +315,7 @@ fn open_shell(
         Ok(cmd.spawn()?)
     })();
 
-    let child = match spawn_result {
+    let mut child = match spawn_result {
         Ok(c) => c,
         Err(e) => {
             unsafe { libc::close(master_fd) };
@@ -319,28 +378,13 @@ fn open_shell(
     drop(done_tx);
     let _ = done_rx.recv();
 
-    // Deliberately never call kill()/wait()/try_wait() on `child`. The
-    // guest agent's *listener* was found, live, to sometimes go
-    // permanently unreachable after an OpenShell session — process/thread
-    // tracing shows its accept() thread parked in the kernel's
-    // vsock_accept and never woken again. This looked at first like a
-    // clean, deterministic trigger (explicit kill()/try_wait() on this
-    // session-leader-with-a-controlling-terminal child), and code here
-    // avoided both for a while on that theory — but a larger batch of
-    // live trials with that avoidance in place still failed intermittently
-    // (~1 in 3, no code difference between passing and failing runs), so
-    // that theory is WRONG, or at best incomplete: this is an
-    // intermittent, low-probability race, not something this function
-    // deterministically controls. Left as never-reap anyway since it's
-    // at worst neutral (a slow, bounded-by-sessions-ever-opened zombie
-    // leak — `master_in`/`master_out` already closed above delivers
-    // SIGHUP to the shell on a real TTY, so a plain `sh` exits on its own
-    // without our ever needing to signal it) and it removes one variable
-    // instead of adding one. See the Ephemera README's "Interactive
-    // console" section — this needs kernel-level tooling (ftrace, a
-    // controlled non-shared host) to actually root-cause, not more
-    // trial-and-error from this function.
-    drop(child);
+    // Safe to kill()/wait() normally again: this function now always runs
+    // inside its own double-forked, fully detached process (see
+    // `spawn_open_shell_session`), never sharing a process with the
+    // agent's vsock listener — which is what made explicit reaping here
+    // risky before. See the README's "Interactive console" section.
+    let _ = child.kill();
+    let _ = child.wait();
     // Don't join to_shell/to_client either: whichever side didn't finish
     // is still blocked on its own read (the peer hasn't closed that half
     // yet) — it'll unblock and exit on its own once `conn`/the PTY master

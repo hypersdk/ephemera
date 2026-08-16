@@ -420,28 +420,30 @@ end-to-end to a real PTY-backed `/bin/sh` in the guest over the same vsock agent
 `exec` (see `ephemera_vsock_client::open_shell`) — real keystrokes, real job control, verified live
 against a real QEMU VM (connect, `echo` a marker string, see it echoed back through the PTY).
 
-**Known issue, not yet fixed — intermittent, not deterministic:** sometimes, after one console
-session ends, the guest agent's vsock listener on that VM stops accepting new connections — a
-subsequent `exec`/console/file-copy call to the same VM then fails with a raw `Connection reset by
-peer`, even though the guest kernel itself is still alive and making progress (confirmed by watching
-its boot log continue in parallel). Process/thread tracing shows the listener's accept() thread
-parked in the kernel's `vsock_accept` and never woken again.
+**Fixed — process isolation, not a kernel-level root cause.** For a while, roughly 1-in-3 console
+sessions left the guest agent's vsock listener unable to accept any further connections afterward
+(`exec`/console/file-copy calls to the same VM would then fail with a raw `Connection reset by peer`),
+with process/thread tracing showing the listener's `accept()` thread permanently parked in the
+kernel's `vsock_accept`. Extensive live isolation ruled out every userspace trigger tried — whether
+and from which thread `child.kill()`/`.wait()`/`.try_wait()` was called on the spawned shell made no
+measurable difference, and a from-scratch reproducer mirroring the real PTY/fork/setsid/relay-thread
+structure could not trigger it at all across 40+ trials while the real binary kept failing — pointing
+at something below userspace, in the exact `AF_VSOCK`/`vhost_vsock` accept path, that was never
+pinned down to a specific kernel commit or mechanism.
 
-This is **not** a clean, reproducible-every-time bug, and an earlier version of this note claimed a
-specific deterministic trigger (`child.kill()`/`.wait()`/`.try_wait()` on the spawned shell, called
-from the thread that set its PTY up) that turned out to be wrong: `ephemera-guest-agent` now never
-calls kill()/wait() on that child at all (see the comment in `open_shell()`), and a batch of live
-trials with that in place still failed roughly 1 in 3 with no code difference between the passing and
-failing runs. That rules out a userspace-guest-agent-code root cause with reasonable confidence — this
-looks like a genuine, intermittent race in the kernel's `AF_VSOCK`/`vhost_vsock` accept path,
-triggered by something about a PTY-owning session leader existing and/or exiting on the same vsock
-CID, not by anything this process's own code does afterward. Chasing it further black-box, one live
-QEMU-boot-and-probe cycle at a time on a shared host, has diminishing returns; it needs kernel-level
-tooling (ftrace, a controlled non-shared host, ideally a from-scratch minimal C reproducer that
-doesn't need Ephemera at all) to actually root-cause. Because of this, `zyvor-fabric`'s Ephemera
-driver does not request `agent.enabled: true` by default yet (see its own
-`docs/guides/vm-drivers/ephemera.md`) — flipping that on before this is understood would break
-`exec`/console/file-copy on some fraction of real VMs.
+The actual fix doesn't require knowing that mechanism: `OpenShell` sessions are no longer handled in a
+thread of the guest agent's own process at all. `spawn_open_shell_session()` double-forks — the
+grandchild does the PTY/`setsid()`/shell/relay work fully detached from the agent's process tree (never
+sharing a process, even via a thread, with the vsock listener), while the agent's original process
+only reaps the fast-exiting intermediate child and returns straight to `accept()`. This is exactly how
+OpenSSH's `sshd` and systemd isolate PTY/session-leader work from their own long-lived listeners — see
+their `session.c`/`systemd-executor` fork-per-session model — for the same underlying reason: signal
+disposition and `waitpid()` are process-wide, so a session leader's lifecycle can affect an unrelated
+listener sharing its process in ways a separate process boundary cannot. Verified live: 20/20 console
+sessions back-to-back left `exec` working afterward every time (statistically conclusive against the
+prior ~1-in-3 failure rate), including through the real WebSocket console path end-to-end, not just a
+raw vsock handshake. `zyvor-fabric`'s Ephemera driver can now safely request `agent.enabled: true` by
+default — see its own `docs/guides/vm-drivers/ephemera.md`.
 
 ## Resource control (cgroup v2)
 

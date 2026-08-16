@@ -11,13 +11,15 @@ Type=simple
 ExecStart=/usr/local/bin/ephemera --config /etc/ephemera.toml serve
 Restart=on-failure
 RestartSec=2
-# TAP creation needs CAP_NET_ADMIN. KVM needs /dev/kvm access.
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
+# TAP creation needs CAP_NET_ADMIN. KVM needs /dev/kvm access. Disk
+# provisioning (cloud-init/agent injection via guestfs) attaches the image
+# through /dev/nbd*, which needs CAP_SYS_ADMIN for the NBD_SET_SOCK ioctl.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ephemera /run/ephemera
+ReadWritePaths=/var/lib/ephemera /run/ephemera /var/lock
 
 [Install]
 WantedBy=multi-user.target

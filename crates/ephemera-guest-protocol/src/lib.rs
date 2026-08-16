@@ -23,6 +23,13 @@ pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 30;
 /// `agent.enabled: false`).
 pub const TOKEN_FILE_PATH: &str = "/etc/ephemera-guest-agent.token";
 
+/// Requests/responses carrying file content are capped at this size —
+/// generous for config files and small scripts (what `copy_to`/`copy_from`
+/// are actually used for), small enough that a base64-in-one-JSON-line
+/// transfer (no chunking/streaming) stays sane in guest-agent and host
+/// memory alike. Bulk data belongs in a disk image, not this channel.
+pub const MAX_FILE_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum AgentRequest {
@@ -32,6 +39,19 @@ pub enum AgentRequest {
         #[serde(default)]
         timeout_seconds: Option<u64>,
     },
+    /// Write `content_base64` (decoded) to `path` inside the guest,
+    /// creating parent directories as needed. Replaces machinectl's
+    /// `copy-to`.
+    PutFile {
+        path: String,
+        content_base64: String,
+        /// Unix permission bits, e.g. `0o644`. Defaults to `0o644` if unset.
+        #[serde(default)]
+        mode: Option<u32>,
+    },
+    /// Read `path` from inside the guest, returned base64-encoded in
+    /// [`AgentResponse::FileContent`]. Replaces machinectl's `copy-from`.
+    GetFile { path: String },
     Shutdown,
 }
 
@@ -83,6 +103,12 @@ pub enum AgentResponse {
         exit_code: i32,
         stdout: String,
         stderr: String,
+    },
+    FileWritten,
+    FileContent {
+        content_base64: String,
+        /// Unix permission bits the file had on the guest, e.g. `0o644`.
+        mode: u32,
     },
     ShuttingDown,
     Error {
@@ -140,5 +166,35 @@ mod tests {
         let env: Envelope = decode_line(line).unwrap();
         assert!(env.token.is_none());
         assert!(matches!(env.request, AgentRequest::Ping));
+    }
+
+    #[test]
+    fn put_file_and_get_file_round_trip() {
+        let put = AgentRequest::PutFile {
+            path: "/etc/myapp/config.yaml".into(),
+            content_base64: "aGVsbG8=".into(),
+            mode: Some(0o600),
+        };
+        let line = encode_line(&put).unwrap();
+        assert!(line.contains("\"op\":\"put-file\""));
+        let back: AgentRequest = decode_line(&line).unwrap();
+        match back {
+            AgentRequest::PutFile { path, content_base64, mode } => {
+                assert_eq!(path, "/etc/myapp/config.yaml");
+                assert_eq!(content_base64, "aGVsbG8=");
+                assert_eq!(mode, Some(0o600));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+
+        let get = AgentRequest::GetFile { path: "/etc/myapp/config.yaml".into() };
+        let line = encode_line(&get).unwrap();
+        assert!(line.contains("\"op\":\"get-file\""));
+
+        let resp = AgentResponse::FileContent { content_base64: "aGVsbG8=".into(), mode: 0o600 };
+        let line = encode_line(&resp).unwrap();
+        assert!(line.contains("\"result\":\"file-content\""));
+        let back: AgentResponse = decode_line(&line).unwrap();
+        assert!(matches!(back, AgentResponse::FileContent { mode: 0o600, .. }));
     }
 }

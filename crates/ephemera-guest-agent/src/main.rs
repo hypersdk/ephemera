@@ -13,8 +13,10 @@ use anyhow::Context;
 #[cfg(target_os = "linux")]
 use ephemera_guest_protocol::{
     constant_time_eq, decode_line, encode_line, AgentRequest, AgentResponse, Envelope,
-    DEFAULT_EXEC_TIMEOUT_SECS, TOKEN_FILE_PATH,
+    DEFAULT_EXEC_TIMEOUT_SECS, MAX_FILE_TRANSFER_BYTES, TOKEN_FILE_PATH,
 };
+#[cfg(target_os = "linux")]
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "linux")]
@@ -126,6 +128,8 @@ fn handle_connection(file: std::fs::File, expected_token: &Option<String>) -> Re
         AgentRequest::Exec { command, timeout_seconds } => {
             exec_with_timeout(&command, Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)))
         }
+        AgentRequest::PutFile { path, content_base64, mode } => put_file(&path, &content_base64, mode),
+        AgentRequest::GetFile { path } => get_file(&path),
         AgentRequest::Shutdown => {
             writer.write_all(encode_line(&AgentResponse::ShuttingDown)?.as_bytes())?;
             writer.flush()?;
@@ -201,5 +205,99 @@ fn exec_with_timeout(command: &str, timeout: Duration) -> AgentResponse {
         None => AgentResponse::Error {
             message: format!("command exceeded {}s timeout and was killed", timeout.as_secs()),
         },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn put_file(path: &str, content_base64: &str, mode: Option<u32>) -> AgentResponse {
+    let bytes = match B64.decode(content_base64) {
+        Ok(b) => b,
+        Err(e) => return AgentResponse::Error { message: format!("content is not valid base64: {e}") },
+    };
+    if bytes.len() > MAX_FILE_TRANSFER_BYTES {
+        return AgentResponse::Error {
+            message: format!("content is {} bytes, exceeds the {}-byte transfer limit", bytes.len(), MAX_FILE_TRANSFER_BYTES),
+        };
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return AgentResponse::Error { message: format!("creating {}: {e}", parent.display()) };
+        }
+    }
+    if let Err(e) = std::fs::write(path, &bytes) {
+        return AgentResponse::Error { message: format!("writing {path}: {e}") };
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(mode.unwrap_or(0o644));
+    if let Err(e) = std::fs::set_permissions(path, perms) {
+        return AgentResponse::Error { message: format!("setting permissions on {path}: {e}") };
+    }
+    AgentResponse::FileWritten
+}
+
+#[cfg(target_os = "linux")]
+fn get_file(path: &str) -> AgentResponse {
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => return AgentResponse::Error { message: format!("reading {path}: {e}") },
+    };
+    if metadata.len() as usize > MAX_FILE_TRANSFER_BYTES {
+        return AgentResponse::Error {
+            message: format!("{path} is {} bytes, exceeds the {}-byte transfer limit", metadata.len(), MAX_FILE_TRANSFER_BYTES),
+        };
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return AgentResponse::Error { message: format!("reading {path}: {e}") },
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode() & 0o777;
+    AgentResponse::FileContent { content_base64: B64.encode(&bytes), mode }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_file_creates_parent_dirs_and_sets_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.yaml");
+        let resp = put_file(path.to_str().unwrap(), &B64.encode(b"hello"), Some(0o600));
+        assert!(matches!(resp, AgentResponse::FileWritten));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn put_file_rejects_invalid_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        let resp = put_file(path.to_str().unwrap(), "not-valid-base64!!!", None);
+        assert!(matches!(resp, AgentResponse::Error { .. }));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn get_file_round_trips_put_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        put_file(path.to_str().unwrap(), &B64.encode(b"hello world"), Some(0o640));
+
+        match get_file(path.to_str().unwrap()) {
+            AgentResponse::FileContent { content_base64, mode } => {
+                assert_eq!(B64.decode(&content_base64).unwrap(), b"hello world");
+                assert_eq!(mode, 0o640);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_file_errors_on_missing_path() {
+        let resp = get_file("/nonexistent/path/for/sure");
+        assert!(matches!(resp, AgentResponse::Error { .. }));
     }
 }

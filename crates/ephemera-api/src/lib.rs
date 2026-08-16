@@ -94,6 +94,8 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/pressure", get(vm_pressure))
         .route("/v1/vms/{id}/logs", get(vm_logs))
         .route("/v1/vms/{id}/agent", post(agent_exec))
+        .route("/v1/vms/{id}/agent/put-file", post(agent_put_file))
+        .route("/v1/vms/{id}/agent/get-file", post(agent_get_file))
         .route("/v1/images/build", post(build_image))
         .route("/v1/images/catalog", post(add_catalog_entry))
         .route("/v1/images/catalog/{name}", delete(remove_catalog_entry))
@@ -338,6 +340,39 @@ async fn agent_exec(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(role)?;
     let response = m.exec(id, req.command, req.timeout_seconds).await?;
+    Ok(Json(json!(response)))
+}
+
+#[derive(Deserialize)]
+struct PutFileRequest {
+    path: String,
+    content_base64: String,
+    #[serde(default)]
+    mode: Option<u32>,
+}
+async fn agent_put_file(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PutFileRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    let response = m.put_file(id, req.path, req.content_base64, req.mode).await?;
+    Ok(Json(json!(response)))
+}
+
+#[derive(Deserialize)]
+struct GetFileRequest {
+    path: String,
+}
+async fn agent_get_file(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<GetFileRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    let response = m.get_file(id, req.path).await?;
     Ok(Json(json!(response)))
 }
 async fn delete_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {

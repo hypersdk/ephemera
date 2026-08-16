@@ -557,6 +557,20 @@ impl VmManager {
         ephemera_vsock_client::call(&vm, AgentRequest::Exec { command, timeout_seconds }, wait).await
     }
 
+    /// Write a file into the guest over the vsock agent — see
+    /// `AgentRequest::PutFile`.
+    pub async fn put_file(&self, id: Uuid, path: String, content_base64: String, mode: Option<u32>) -> Result<ephemera_guest_protocol::AgentResponse> {
+        let vm = self.get(id).await?;
+        ephemera_vsock_client::call(&vm, AgentRequest::PutFile { path, content_base64, mode }, ephemera_vsock_client::DEFAULT_CALL_TIMEOUT).await
+    }
+
+    /// Read a file from the guest over the vsock agent — see
+    /// `AgentRequest::GetFile`.
+    pub async fn get_file(&self, id: Uuid, path: String) -> Result<ephemera_guest_protocol::AgentResponse> {
+        let vm = self.get(id).await?;
+        ephemera_vsock_client::call(&vm, AgentRequest::GetFile { path }, ephemera_vsock_client::DEFAULT_CALL_TIMEOUT).await
+    }
+
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         let mut vm = self.get(id).await?;
         // A Paused VM is not "already stopped" — its process is fully

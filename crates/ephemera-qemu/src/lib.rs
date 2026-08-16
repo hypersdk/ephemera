@@ -11,13 +11,23 @@ use ephemera_core::{
     model::{BackendKind, CreateVmRequest, NetworkSpec, VmRecord},
     process::spawn_logged,
 };
+use std::path::PathBuf;
 use std::time::Duration;
 
 const QMP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for each `virtiofsd` to create its listening socket
+/// before giving up and launching QEMU anyway (which would then fail to
+/// connect with a clear error, rather than this hanging indefinitely).
+const VIRTIOFSD_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct QemuBackend;
 
-pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<String>> {
+/// One `virtiofsd` instance's device-facing identity, resolved before QEMU
+/// itself is built/launched — `(tag, socket_path)`, index-ordered with
+/// `req.shared_folders` (`tag` is always `"fs{index}"`).
+pub type VirtiofsSocket = (String, PathBuf);
+
+pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: &[VirtiofsSocket]) -> Result<Vec<String>> {
     // A `StorageBackend::Nbd` disk isn't opened as a local file at all — it's
     // attached via QEMU's native nbd: block client against the qemu-nbd
     // export this VM owns. Every other storage backend (including the
@@ -41,6 +51,19 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<Stri
 
     if let Some(seed) = &ctx.seed_disk {
         a.extend(["-drive".into(), format!("file={},if=virtio,format=raw,readonly=on", path_arg(seed))]);
+    }
+
+    // virtiofs requires the guest's RAM to be backed by shared memory, not
+    // QEMU's default anonymous allocation — `vhost-user-fs-pci` otherwise
+    // fails to attach. `-m` above still sets the *size*; this object is
+    // what makes the *backing* shareable with the virtiofsd process(es).
+    if !virtiofs_sockets.is_empty() {
+        a.extend(["-object".into(), format!("memory-backend-memfd,id=mem,size={}M,share=on", req.memory_mib)]);
+        a.extend(["-numa".into(), "node,memdev=mem".into()]);
+    }
+    for (i, (tag, socket)) in virtiofs_sockets.iter().enumerate() {
+        a.extend(["-chardev".into(), format!("socket,id=vfsock{i},path={}", path_arg(socket))]);
+        a.extend(["-device".into(), format!("vhost-user-fs-pci,queue-size=1024,chardev=vfsock{i},tag={tag}")]);
     }
 
     match &ctx.network.spec {
@@ -87,12 +110,81 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext) -> Result<Vec<Stri
     Ok(a)
 }
 
+/// Spawns one `virtiofsd` per `req.shared_folders` entry, in order, each
+/// listening on its own socket under `ctx.workspace`. On any failure,
+/// already-spawned instances from this call are killed before returning —
+/// callers never have to reconcile a partial set themselves.
+async fn spawn_virtiofsd_instances(
+    cfg: &Config,
+    req: &CreateVmRequest,
+    ctx: &LaunchContext,
+) -> Result<(Vec<u32>, Vec<VirtiofsSocket>)> {
+    let mut pids = Vec::new();
+    let mut sockets = Vec::new();
+    for (i, share) in req.shared_folders.iter().enumerate() {
+        let socket = ctx.workspace.join(format!("virtiofs-{i}.sock"));
+        let tag = format!("fs{i}");
+        let mut args = vec![
+            "--socket-path".to_string(), path_arg(&socket),
+            "--shared-dir".to_string(), path_arg(&share.host_path),
+        ];
+        if share.read_only {
+            args.push("--readonly".to_string());
+        }
+        let log = ctx.workspace.join(format!("virtiofsd-{i}.log"));
+        let spawn_result = spawn_logged(&cfg.virtiofsd_binary, &args, &log)
+            .await
+            .with_context(|| format!("spawning virtiofsd for shared_folders[{i}] ({})", share.host_path.display()));
+        let child = match spawn_result {
+            Ok(c) => c,
+            Err(e) => {
+                kill_pids(&pids);
+                return Err(e);
+            }
+        };
+        let Some(pid) = child.id() else {
+            kill_pids(&pids);
+            anyhow::bail!("virtiofsd for shared_folders[{i}] exited before PID was available");
+        };
+        // virtiofsd creates its listening socket asynchronously after
+        // startup; QEMU connects as the vhost-user client and needs it to
+        // already exist. Not finding it within the timeout isn't fatal
+        // here — QEMU will fail to connect with its own clear error, which
+        // beats hanging this launch indefinitely on a stuck virtiofsd.
+        let deadline = tokio::time::Instant::now() + VIRTIOFSD_SOCKET_TIMEOUT;
+        while !socket.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        pids.push(pid);
+        sockets.push((tag, socket));
+    }
+    Ok((pids, sockets))
+}
+
+fn kill_pids(pids: &[u32]) {
+    for pid in pids {
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 #[async_trait]
 impl VmBackend for QemuBackend {
     fn kind(&self) -> BackendKind { BackendKind::Qemu }
 
     async fn launch(&self, cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext) -> Result<LaunchResult> {
-        let args = build_args(req, ctx)?;
+        let (virtiofsd_pids, virtiofs_sockets) = match spawn_virtiofsd_instances(cfg, req, ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(fd) = ctx.network.macvtap_fd {
+                    ephemera_core::process::close_fd(fd);
+                }
+                return Err(e);
+            }
+        };
+
+        let args = build_args(req, ctx, &virtiofs_sockets)?;
         let (program, args) = ephemera_core::process::netns_wrap(ctx.network.netns.as_deref(), &cfg.qemu_binary, &args);
         let spawned = spawn_logged(&program, &args, &ctx.log_path).await;
         // The child inherits the macvtap fd across exec (or spawn failed and
@@ -100,9 +192,18 @@ impl VmBackend for QemuBackend {
         if let Some(fd) = ctx.network.macvtap_fd {
             ephemera_core::process::close_fd(fd);
         }
-        let child = spawned?;
-        let pid = child.id().context("QEMU exited before PID was available")?;
-        Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("qmp.sock")), jail_path: None, vsock_socket: None })
+        let child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                kill_pids(&virtiofsd_pids);
+                return Err(e);
+            }
+        };
+        let Some(pid) = child.id() else {
+            kill_pids(&virtiofsd_pids);
+            anyhow::bail!("QEMU exited before PID was available");
+        };
+        Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("qmp.sock")), jail_path: None, vsock_socket: None, virtiofsd_pids })
     }
 
     async fn pause(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
@@ -118,5 +219,72 @@ impl VmBackend for QemuBackend {
     async fn graceful_shutdown(&self, _cfg: &Config, vm: &VmRecord) -> Result<()> {
         qmp::execute(&vm.workspace.join("qmp.sock"), "system_powerdown", None, QMP_TIMEOUT).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ephemera_core::backend::PreparedNetwork;
+    use ephemera_core::model::NetworkSpec;
+
+    fn req(memory_mib: u64) -> CreateVmRequest {
+        CreateVmRequest {
+            name: "fixture".into(),
+            backend: BackendKind::Qemu,
+            image: "/tmp/base.qcow2".into(),
+            vcpus: 1,
+            memory_mib,
+            disk_size_gib: None,
+            kernel: None,
+            initrd: None,
+            firmware: None,
+            kernel_args: None,
+            network: NetworkSpec::None,
+            cloud_init: None,
+            ttl_seconds: None,
+            extra_args: vec![],
+            agent: None,
+            storage: ephemera_core::model::StorageBackend::Default,
+            shared_folders: vec![],
+        }
+    }
+
+    fn ctx() -> LaunchContext {
+        LaunchContext {
+            id: uuid::Uuid::nil(),
+            workspace: "/tmp/eph-fixture".into(),
+            disk: "/tmp/eph-fixture/root.qcow2".into(),
+            seed_disk: None,
+            log_path: "/tmp/eph-fixture/console.log".into(),
+            network: PreparedNetwork { spec: NetworkSpec::None, tap_name: None, macvtap_fd: None, netns: None },
+            guest_cid: None,
+            vsock_socket: None,
+            disk_format: "qcow2".into(),
+            nbd_export: None,
+        }
+    }
+
+    #[test]
+    fn no_shares_means_no_virtiofs_args() {
+        let args = build_args(&req(2048), &ctx(), &[]).unwrap();
+        assert!(!args.iter().any(|a| a.contains("memory-backend-memfd")));
+        assert!(!args.iter().any(|a| a.contains("vhost-user-fs-pci")));
+        assert!(args.iter().any(|a| a == "2048"));
+    }
+
+    #[test]
+    fn shares_add_shared_memory_backend_and_one_device_per_share() {
+        let sockets: Vec<VirtiofsSocket> = vec![
+            ("fs0".to_string(), "/tmp/eph-fixture/virtiofs-0.sock".into()),
+            ("fs1".to_string(), "/tmp/eph-fixture/virtiofs-1.sock".into()),
+        ];
+        let args = build_args(&req(4096), &ctx(), &sockets).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("memory-backend-memfd,id=mem,size=4096M,share=on"));
+        assert!(joined.contains("numa node,memdev=mem"));
+        assert!(joined.contains("chardev=vfsock0,tag=fs0"));
+        assert!(joined.contains("chardev=vfsock1,tag=fs1"));
+        assert_eq!(args.iter().filter(|a| a.as_str() == "vhost-user-fs-pci,queue-size=1024,chardev=vfsock0,tag=fs0").count(), 1);
     }
 }

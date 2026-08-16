@@ -150,7 +150,7 @@ async fn launch_direct(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext)
     let (program, args) = ephemera_core::process::netns_wrap(ctx.network.netns.as_deref(), &cfg.firecracker_binary, &args);
     let child = spawn_logged(&program, &args, &ctx.log_path).await?;
     let pid = child.id().context("Firecracker exited before PID was available")?;
-    Ok(LaunchResult { pid, control_socket: Some(api), jail_path: None, vsock_socket: ctx.vsock_socket.clone() })
+    Ok(LaunchResult { pid, control_socket: Some(api), jail_path: None, vsock_socket: ctx.vsock_socket.clone(), virtiofsd_pids: Vec::new() })
 }
 
 /// Runs Firecracker through its own `jailer` binary (chroot, uid/gid drop,
@@ -236,6 +236,7 @@ async fn launch_jailed(cfg: &Config, req: &CreateVmRequest, ctx: &LaunchContext)
         control_socket: Some(chroot_root.join("run/firecracker.socket")),
         vsock_socket: vsock_socket_host,
         jail_path: Some(chroot_root),
+        virtiofsd_pids: Vec::new(),
     })
 }
 

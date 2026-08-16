@@ -79,7 +79,7 @@ impl VmBackend for CloudHypervisorBackend {
         }
         let child = spawned?;
         let pid = child.id().context("Cloud Hypervisor exited before PID was available")?;
-        Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("ch-api.sock")), jail_path: None, vsock_socket: ctx.vsock_socket.clone() })
+        Ok(LaunchResult { pid, control_socket: Some(ctx.workspace.join("ch-api.sock")), jail_path: None, vsock_socket: ctx.vsock_socket.clone(), virtiofsd_pids: Vec::new() })
     }
 
     async fn pause(&self, cfg: &Config, vm: &VmRecord) -> Result<()> {

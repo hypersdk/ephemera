@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use ephemera_core::{
     backend::{LaunchContext, VmBackend},
     config::Config,
-    model::{BackendKind, ClaimOverrides, CreateVmRequest, PoolRecord, PoolSpec, StorageBackend, VmRecord, VmStatus},
+    model::{BackendKind, ClaimOverrides, CloudInitSpec, CreateVmRequest, PoolRecord, PoolSpec, StorageBackend, VmRecord, VmStatus},
     process,
 };
 use ephemera_guest_protocol::AgentRequest;
@@ -196,6 +196,29 @@ impl VmManager {
         }
     }
 
+    /// `req.cloud_init` with a mount runcmd appended per `req.shared_folders`
+    /// entry — writing a real `/etc/fstab` line (not just a one-shot `mount`
+    /// command) so the share keeps working across a later stop/start, since
+    /// cloud-init's own `runcmd` module only replays on a *new* instance-id,
+    /// not a relaunch of the same VM (see `VmManager::start`'s doc comment).
+    /// `Some` even when the caller passed no `cloud_init` at all, as long as
+    /// there's at least one share to mount — otherwise the share would be
+    /// attached to the guest but never actually reachable inside it.
+    fn effective_cloud_init(req: &CreateVmRequest) -> Option<CloudInitSpec> {
+        if req.shared_folders.is_empty() {
+            return req.cloud_init.clone();
+        }
+        let mut ci = req.cloud_init.clone().unwrap_or_default();
+        for (i, share) in req.shared_folders.iter().enumerate() {
+            let tag = format!("fs{i}");
+            let path = &share.guest_path;
+            ci.runcmd.push(format!("mkdir -p {path}"));
+            ci.runcmd.push(format!("grep -qF ' {path} ' /etc/fstab || echo '{tag} {path} virtiofs defaults 0 0' >> /etc/fstab"));
+            ci.runcmd.push(format!("mount {path}"));
+        }
+        Some(ci)
+    }
+
     fn cgroup_manager(&self, vm: &VmRecord) -> Result<ephemera_cgroup::CgroupManager> {
         let path = vm.cgroup_path.clone().with_context(|| {
             format!("VM {} has no cgroup (not running, or cgroup setup failed at launch)", vm.id)
@@ -349,6 +372,7 @@ impl VmManager {
             netns: None,
             lvm_lv: None,
             nbd_pid: None,
+            virtiofsd_pids: Vec::new(),
         };
         // Deciding the CID and reserving it happen as one atomic, locked
         // operation in the store — see ephemera-storage::Store::insert_with_cid
@@ -365,7 +389,8 @@ impl VmManager {
             record.disk = provisioned.disk.clone();
             record.lvm_lv = provisioned.lvm_lv.clone();
             record.nbd_pid = provisioned.nbd_pid;
-            let seed = match &req.cloud_init {
+            let effective_cloud_init = Self::effective_cloud_init(&req);
+            let seed = match &effective_cloud_init {
                 Some(ci) => Some(ephemera_image::cloudinit::build_seed(&self.cfg, &workspace, ci).await?),
                 None => None,
             };
@@ -400,6 +425,7 @@ impl VmManager {
             record.control_socket = launch.control_socket;
             record.jail_path = launch.jail_path;
             record.vsock_socket = launch.vsock_socket;
+            record.virtiofsd_pids = launch.virtiofsd_pids;
             Self::attach_cgroup(id, launch.pid, &mut record);
             record.status = VmStatus::Running;
             Ok(())
@@ -479,6 +505,7 @@ impl VmManager {
             vm.control_socket = launch.control_socket;
             vm.jail_path = launch.jail_path;
             vm.vsock_socket = launch.vsock_socket;
+            vm.virtiofsd_pids = launch.virtiofsd_pids;
             Self::attach_cgroup(id, launch.pid, &mut vm);
             vm.status = VmStatus::Running;
             vm.error = None;
@@ -518,6 +545,14 @@ impl VmManager {
         }
         if let Some(tap) = &vm.tap_name { let _ = ephemera_network::cleanup(id, &vm.request.network, tap, vm.netns.as_deref()).await; }
         vm.netns = None;
+        // virtiofsd instances aren't reattachable the way qemu-nbd's export
+        // is (see the Nbd comment in `start`) — a fresh set gets spawned on
+        // the next `start`, so tear these down unconditionally here.
+        for pid in vm.virtiofsd_pids.drain(..) {
+            if process::process_alive(pid).await {
+                let _ = process::terminate_pid(pid).await;
+            }
+        }
         // cgroup v2 requires a cgroup to be empty (no PIDs left in
         // cgroup.procs) before rmdir succeeds — safe here since the process
         // is confirmed dead by this point either way (graceful exit,
@@ -902,7 +937,43 @@ mod tests {
             extra_args: vec![],
             agent: None,
             storage: StorageBackend::Default,
+            shared_folders: vec![],
         }
+    }
+
+    #[test]
+    fn effective_cloud_init_is_unchanged_with_no_shares() {
+        let r = req(BackendKind::Qemu, None, None);
+        assert!(VmManager::effective_cloud_init(&r).is_none());
+    }
+
+    #[test]
+    fn effective_cloud_init_synthesizes_mount_commands_with_no_prior_cloud_init() {
+        let mut r = req(BackendKind::Qemu, None, None);
+        r.shared_folders = vec![ephemera_core::model::SharedFolder {
+            host_path: "/srv/data".into(),
+            guest_path: "/mnt/data".into(),
+            read_only: false,
+        }];
+        let ci = VmManager::effective_cloud_init(&r).unwrap();
+        let joined = ci.runcmd.join("\n");
+        assert!(joined.contains("mkdir -p /mnt/data"));
+        assert!(joined.contains("fs0 /mnt/data virtiofs defaults 0 0"));
+        assert!(joined.contains("mount /mnt/data"));
+    }
+
+    #[test]
+    fn effective_cloud_init_appends_to_an_existing_cloud_init() {
+        let mut r = req(BackendKind::Qemu, None, None);
+        r.cloud_init = Some(CloudInitSpec { runcmd: vec!["echo hi".to_string()], ..Default::default() });
+        r.shared_folders = vec![ephemera_core::model::SharedFolder {
+            host_path: "/srv/data".into(),
+            guest_path: "/mnt/data".into(),
+            read_only: true,
+        }];
+        let ci = VmManager::effective_cloud_init(&r).unwrap();
+        assert_eq!(ci.runcmd[0], "echo hi");
+        assert!(ci.runcmd.iter().any(|c| c.contains("/mnt/data")));
     }
 
     #[test]

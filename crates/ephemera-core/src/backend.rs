@@ -68,6 +68,10 @@ pub struct LaunchResult {
     /// `ephemera_vsock_client` dials this path directly rather than
     /// reconstructing it, so it works for both cases.
     pub vsock_socket: Option<PathBuf>,
+    /// PIDs of the `virtiofsd` processes spawned for `req.shared_folders`,
+    /// one per share, in order — see `VmRecord::virtiofsd_pids`. Empty for
+    /// every backend but QEMU, and for QEMU when the request has no shares.
+    pub virtiofsd_pids: Vec<u32>,
 }
 
 #[async_trait]

@@ -14,6 +14,9 @@ pub struct Config {
     pub run_dir: PathBuf,
     pub qemu_binary: String,
     pub qemu_img_binary: String,
+    /// Only consulted when a `CreateVmRequest` has `shared_folders` — one
+    /// instance is spawned per share, QEMU backend only.
+    pub virtiofsd_binary: String,
     pub cloud_hypervisor_binary: String,
     pub ch_remote_binary: String,
     pub cloud_localds_binary: String,
@@ -37,6 +40,7 @@ impl Default for Config {
             run_dir: "/run/ephemera".into(),
             qemu_binary: "qemu-system-x86_64".into(),
             qemu_img_binary: "qemu-img".into(),
+            virtiofsd_binary: "virtiofsd".into(),
             cloud_hypervisor_binary: "cloud-hypervisor".into(),
             ch_remote_binary: "ch-remote".into(),
             cloud_localds_binary: "cloud-localds".into(),

@@ -148,6 +148,24 @@ pub struct CloudInitSpec {
     pub runcmd: Vec<String>,
 }
 
+/// A host directory shared into the guest via virtiofs, declared at create
+/// time — there's no live "mount this now" equivalent for a real hardware
+/// VM the way `machinectl bind` had for nspawn's shared-kernel containers
+/// (see the systemd-removal migration plan's bind-mount notes). Requires
+/// `virtiofsd` on the host `$PATH`; only supported by the QEMU backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedFolder {
+    pub host_path: PathBuf,
+    /// Where to mount it inside the guest. Auto-mounted via a generated
+    /// cloud-init `runcmd` entry when `cloud_init` is set on the request
+    /// (see `VmManager::create`); otherwise the guest must run
+    /// `mount -t virtiofs <tag> <guest_path>` itself, where `<tag>` is
+    /// this share's index in `shared_folders` (`"fs0"`, `"fs1"`, ...).
+    pub guest_path: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVmRequest {
     pub name: String,
@@ -179,6 +197,8 @@ pub struct CreateVmRequest {
     pub agent: Option<AgentSpec>,
     #[serde(default)]
     pub storage: StorageBackend,
+    #[serde(default)]
+    pub shared_folders: Vec<SharedFolder>,
 }
 fn default_vcpus() -> u8 { 2 }
 fn default_memory() -> u64 { 2048 }
@@ -241,6 +261,11 @@ pub struct VmRecord {
     /// stop/start (like the disk file itself) and reaped only on delete.
     #[serde(default)]
     pub nbd_pid: Option<u32>,
+    /// PIDs of the `virtiofsd` processes backing `request.shared_folders`,
+    /// one per share (same order), kept alive alongside the VM and killed
+    /// on delete/stop by `VmManager` — see `LaunchResult::virtiofsd_pids`.
+    #[serde(default)]
+    pub virtiofsd_pids: Vec<u32>,
 }
 
 /// A named template for a warm pool: `size` VMs matching `template` are

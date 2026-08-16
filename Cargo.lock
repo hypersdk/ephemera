@@ -1119,6 +1119,19 @@ dependencies = [
 [[package]]
 name = "ephemera-agent"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "ephemera-api"

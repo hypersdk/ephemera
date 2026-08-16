@@ -56,15 +56,14 @@ crates/
 ├── ephemera-scheduler             VmManager: VM lifecycle orchestration + TTL reaper
 ├── ephemera-api                   REST API (axum)
 ├── ephemera-cli                   `ephemera` CLI binary (composition root)
-├── ephemera-agent                 reserved: per-host node-agent daemon (multi-node)
+├── ephemera-agent                 fleet registry + per-host node-agent daemon (multi-node)
 └── ephemera-kube                  DisposableVm CRD + node-local Kubernetes operator
 ```
 
-`ephemera-agent` (a distinct concept from `ephemera-guest-agent` above — this one is
-the still-deferred future per-*host* node-agent for multi-node deployments, and
-remains an empty placeholder — see "Production changes I would make next") is not
-to be confused with `ephemera-kube`, which is implemented and verified — see
-"Kubernetes CRD/operator" below.
+`ephemera-agent` (a distinct concept from `ephemera-guest-agent` above — this one is the
+per-*host* node-agent for multi-node deployments) and `ephemera-kube` are both implemented
+and verified against real multi-host/cluster infrastructure — see "Distributed node-agent"
+and "Kubernetes CRD/operator" below.
 
 This project also depends on the sibling [`guestkit`](../guestkit) project (a
 pure-Rust, qemu-nbd-based disk toolkit) as a path dependency from `ephemera-image`,
@@ -101,6 +100,7 @@ for that step — see "Build an image" below.
 - End-to-end networking smoke test (QEMU user-mode NAT, TAP+bridge+DHCP, and macvtap, all SSH-verified).
 - End-to-end lifecycle smoke test (vsock exec, pause/resume, graceful shutdown, and vsock-CID uniqueness under concurrent creates, all verified against real VMs).
 - Kubernetes `DisposableVm` CRD + node-local operator (`ephemera-kube`), verified against a real k3s cluster — see "Kubernetes CRD/operator" below.
+- Distributed node-agent (`ephemera-agent`): central fleet registry + per-host heartbeat client with load-aware placement, verified across two real physically separate hosts — see "Distributed node-agent" below.
 
 ## Host requirements
 
@@ -904,6 +904,57 @@ in-cluster); a `tap`/`macvtap` networking mode in the CRD (needs a device/bridge
 cross-node placement — the "which node should this VM land on" decision is the caller's today, made
 by setting `spec.node` directly, not something this project chooses for you.
 
+## Distributed node-agent
+
+`ephemera-agent` is the non-Kubernetes multi-host story — a caller talks to one central endpoint
+instead of knowing which host a VM is on, distinct from `ephemera-kube`'s per-node reconciliation
+against a *local* ephemera. One binary, two modes:
+
+```bash
+# Central fleet registry + create/list/delete proxy — one instance for the whole fleet.
+ephemera-agent central --listen 0.0.0.0:7799
+
+# Per-host heartbeat client — one instance per hypervisor host, alongside a local `ephemera serve`.
+ephemera-agent node --name worker-1 \
+    --central http://fleet-registry:7799 \
+    --ephemera-url http://127.0.0.1:7788 \
+    --advertise-url http://worker-1.internal:7788
+```
+
+Every `--interval-secs` (default 10), each node agent reports its name, real capacity (vCPUs off
+`available_parallelism()`, RAM off `/proc/meminfo`), and current VM count (via its own local
+`GET /v1/vms`) to the central registry. `POST /fleet/vms` with no `"node"` field picks the healthy
+node with the fewest VMs and proxies the create there; with an explicit `"node"` it targets that node
+directly. `GET /fleet/vms` aggregates every healthy node's VMs, tagged with which node each came from.
+`DELETE /fleet/vms/{node}/{id}` proxies to that exact node.
+
+Verified end to end across two real, physically separate hosts (`scripts/test-fleet-agent.sh`, 11/11
+passing): both hosts register with real capacity; an unaddressed create picks the least-loaded host
+and produces a real QEMU process confirmed on that exact physical host (and confirmed absent on the
+other); a second create lands on the *other* host once the first host's load is known — real
+load-aware placement, not round-robin; the fleet-wide list correctly aggregates and tags VMs from
+both hosts; a fleet-proxied delete reaps the right VM on the right host and leaves the other alone.
+
+**Real bugs found and fixed while testing this across two actual hosts** (bugs that are invisible
+running everything on one machine, which is exactly why this got tested on two real, separate hosts
+instead of just trusting the code): a node's heartbeat originally reported its own `--ephemera-url`
+(almost always a loopback address) straight to central — central's proxy calls for a *remote* node
+would then silently hit whatever was listening on *central's own* localhost instead, with no error at
+all. Fixed by splitting `--ephemera-url` (what this agent uses to reach its own local ephemera) from
+`--advertise-url` (what a remote central should use to reach this same ephemera — must be a real,
+externally routable address). Separately, this test script's own cleanup function first tried
+`sudo pkill -f "target/release/ephemera --config ..."` over SSH — which matched **its own** command
+line (the pattern string is a substring of the `pkill` invocation's own argv) and SIGTERMed itself
+before it ever reached the real target process, leaving the actual `ephemera serve` running every
+time with no error surfaced. Fixed with the standard `[t]arget/...` bracket-escape idiom that keeps
+`pgrep`/`pkill -f` from matching their own invocation.
+
+**Not yet done**: TLS/auth between node agents and central (both sides currently trust any caller who
+can reach the port — fine for a private management network, not for anything exposed further);
+persisting fleet registry state (an `ephemera-agent central` restart forgets every node until their
+next heartbeat, ~`--interval-secs` seconds later); and richer placement policies beyond
+fewest-VMs-wins (no CPU/memory-aware bin-packing, no per-VM node affinity/anti-affinity).
+
 ## State layout
 
 ```text
@@ -941,7 +992,7 @@ assigned the same vsock CID.
 7. **Auth** — mTLS/OIDC, tenant IDs and audit events. Bearer-token REST auth/RBAC (admin/read-only) and a per-VM authenticated guest-agent protocol are already implemented; see "Auth / RBAC" and "Pause, resume, and exec" above.
 8. **Observability** — tracing, per-VM boot timing and failure reasons (a basic Prometheus `/metrics` endpoint — VM counts by status/backend, agent-enabled count — is already implemented; see the REST API section).
 9. **Kubernetes CRD/operator** — already implemented and verified against a real k3s cluster: `DisposableVm` CRD + node-local operator (`ephemera-kube`); see "Kubernetes CRD/operator" above. Not done: packaging it as a real container image/daemonset manifest, a tap/macvtap networking mode in the CRD, and cross-node placement.
-10. **Distributed node-agent** — `ephemera-agent` (the per-*host* one, not `ephemera-guest-agent`) running per hypervisor host, reporting to a central `ephemera-scheduler`.
+10. **Distributed node-agent** — already implemented and verified across two real, physically separate hosts: `ephemera-agent` (the per-*host* one, not `ephemera-guest-agent`) central registry + node heartbeat client; see "Distributed node-agent" above. Not done: TLS/auth between nodes and central, persisted fleet state, and placement policies beyond fewest-VMs-wins.
 11. **Scheduler placement** — NUMA awareness, CPU pinning, hugepages and GPU/VFIO assignment.
 12. **Windows path** — QEMU/Cloud Hypervisor only; UEFI, virtio-win injection, sysprep and unattend support.
 

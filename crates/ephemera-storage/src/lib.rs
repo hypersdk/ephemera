@@ -308,6 +308,7 @@ mod tests {
                 extra_args: vec![],
                 agent: None,
                 storage: Default::default(),
+                shared_folders: vec![],
             },
             guest_cid: None,
             jail_path: None,
@@ -316,6 +317,7 @@ mod tests {
             netns: None,
             lvm_lv: None,
             nbd_pid: None,
+            virtiofsd_pids: vec![],
         }
     }
 

@@ -9,6 +9,10 @@ Firecracker, Cloud Hypervisor, and QEMU/KVM from one Rust-native control plane.
 
 It also contains a small **virt-builder-style image pipeline**: use a local/HTTP base image, verify SHA-256, convert/resize it, and customize it with `virt-customize`.
 
+Beyond a single host: a `DisposableVm` Kubernetes CRD + node-local operator (`ephemera-kube`), and a
+non-Kubernetes distributed node-agent (`ephemera-agent`) with a central fleet registry and load-aware
+placement across multiple hosts — see "Kubernetes CRD/operator" and "Distributed node-agent" below.
+
 > This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC, the Firecracker jailer (chroot + uid/gid isolation), cgroup v2 resource control, and per-VM network namespaces are already implemented (see "Auth / RBAC", "Firecracker jailer", "Resource control (cgroup v2)", and "Network namespaces" below) — before exposing it to untrusted tenants, still add seccomp/AppArmor/SELinux policy, quotas, audit logging and stronger image provenance.
 
 ## Architecture
@@ -164,6 +168,11 @@ cargo build --release
 sudo install -m 0755 target/release/ephemera /usr/local/bin/ephemera
 sudo install -m 0644 config.example.toml /etc/ephemera.toml
 ```
+
+`cargo build --release` also produces `target/release/ephemera-kube` (the Kubernetes operator — see
+"Kubernetes CRD/operator") and `target/release/ephemera-agent` (the fleet registry/node-agent — see
+"Distributed node-agent"); neither is installed by the two commands above, since not every deployment
+needs either.
 
 ## Deploy to a remote host
 
@@ -1006,7 +1015,13 @@ fewest-VMs-wins (no CPU/memory-aware bin-packing, no per-VM node affinity/anti-a
       qmp.sock | ch-api.sock | firecracker.sock
       vsock.sock              (Cloud Hypervisor/Firecracker only, when agent.enabled)
       firecracker.json
+      nbd.sock | nbd.pid      (storage=nbd only — see "Storage backends")
 ```
+
+`storage=lvm-thin` and `storage=ceph-rbd` disks live outside this tree entirely — a thin
+snapshot LV (`/dev/<vg>/eph-<id>`) and an RBD clone (`rbd:<pool>/eph-<id>:...`) respectively,
+both torn down by `delete` via `VmRecord.lvm_lv`/parsing the `rbd:` URI, not by deleting
+anything under `instances/<uuid>/`.
 
 `vms.lock` coordinates `vms.json` reads/writes across concurrent `ephemera` processes (each CLI
 invocation is a separate process, not just a separate task inside `serve`) via an OS-level `flock` —

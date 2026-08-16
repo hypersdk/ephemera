@@ -45,6 +45,11 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: 
         "-m".into(), req.memory_mib.to_string(),
         "-nodefaults".into(),
         "-display".into(), "none".into(),
+        // Fixed, well-known path within this VM's own workspace — no port
+        // allocation, no collision bookkeeping needed. Consumers (e.g.
+        // zyvor-fabric's VNC proxy) derive the same path themselves from
+        // `VmRecord::workspace`, already exposed via the REST API.
+        "-vnc".into(), format!("unix:{}", path_arg(&ctx.workspace.join("vnc.sock"))),
         "-serial".into(), "stdio".into(),
         "-drive".into(), disk_drive,
     ];

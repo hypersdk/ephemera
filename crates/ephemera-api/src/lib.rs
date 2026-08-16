@@ -96,6 +96,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms/{id}/agent", post(agent_exec))
         .route("/v1/vms/{id}/agent/put-file", post(agent_put_file))
         .route("/v1/vms/{id}/agent/get-file", post(agent_get_file))
+        .route("/v1/vms/{id}/console", get(agent_console))
         .route("/v1/images/build", post(build_image))
         .route("/v1/images/catalog", post(add_catalog_entry))
         .route("/v1/images/catalog/{name}", delete(remove_catalog_entry))
@@ -375,6 +376,77 @@ async fn agent_get_file(
     let response = m.get_file(id, req.path).await?;
     Ok(Json(json!(response)))
 }
+#[derive(Deserialize)]
+struct ConsoleQuery {
+    #[serde(default = "default_console_cols")]
+    cols: u16,
+    #[serde(default = "default_console_rows")]
+    rows: u16,
+}
+fn default_console_cols() -> u16 { 80 }
+fn default_console_rows() -> u16 { 24 }
+
+/// `GET /v1/vms/{id}/console` — upgrades to a WebSocket carrying a live
+/// interactive shell (`AgentRequest::OpenShell` under the hood). Once the
+/// vsock handshake completes, this is a raw byte relay in both directions
+/// — binary WS frames in, binary WS frames out, no further framing on
+/// either side.
+async fn agent_console(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<ConsoleQuery>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> ApiResult<Response> {
+    require_admin(role)?;
+    // Open the console *before* upgrading, so a failure (agent disabled,
+    // guest unreachable, VM not found) comes back as a normal HTTP error
+    // instead of a WS connection that opens and then immediately closes
+    // with no useful diagnostic on the client side.
+    let console = m.open_console(id, q.cols, q.rows).await?;
+    Ok(ws.on_upgrade(move |socket| relay_console(socket, console)))
+}
+
+async fn relay_console(socket: axum::extract::ws::WebSocket, console: ephemera_vsock_client::ConsoleStream) {
+    use axum::extract::ws::Message;
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut console_rx, mut console_tx) = tokio::io::split(console);
+
+    let to_console = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let bytes = match msg {
+                Message::Binary(b) => b,
+                Message::Text(t) => t.as_bytes().to_vec().into(),
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            if console_tx.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+    };
+    let to_ws = async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match console_rx.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_tx.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    tokio::select! {
+        _ = to_console => {}
+        _ = to_ws => {}
+    }
+}
+
 async fn delete_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
     require_admin(role)?;
     m.delete(id).await?;
@@ -555,6 +627,7 @@ mod tests {
                 extra_args: vec![],
                 agent: agent_enabled.then(|| AgentSpec { enabled: true, port: 17777, token: None }),
                 storage: Default::default(),
+                shared_folders: vec![],
             },
             guest_cid: None,
             jail_path: None,
@@ -563,6 +636,7 @@ mod tests {
             netns: None,
             lvm_lv: None,
             nbd_pid: None,
+            virtiofsd_pids: vec![],
         }
     }
 

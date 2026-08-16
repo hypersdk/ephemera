@@ -606,6 +606,15 @@ impl VmManager {
         ephemera_vsock_client::call(&vm, AgentRequest::GetFile { path }, ephemera_vsock_client::DEFAULT_CALL_TIMEOUT).await
     }
 
+    /// Open an interactive shell on the guest over the vsock agent — see
+    /// `ephemera_vsock_client::open_shell`. The returned stream is raw PTY
+    /// traffic once the handshake completes; callers relay it themselves
+    /// (e.g. `ephemera-api`'s WebSocket console endpoint).
+    pub async fn open_console(&self, id: Uuid, cols: u16, rows: u16) -> Result<ephemera_vsock_client::ConsoleStream> {
+        let vm = self.get(id).await?;
+        ephemera_vsock_client::open_shell(&vm, cols, rows, ephemera_vsock_client::DEFAULT_CALL_TIMEOUT).await
+    }
+
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         let mut vm = self.get(id).await?;
         // A Paused VM is not "already stopped" — its process is fully

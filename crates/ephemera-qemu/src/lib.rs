@@ -267,7 +267,7 @@ mod tests {
             disk: "/tmp/eph-fixture/root.qcow2".into(),
             seed_disk: None,
             log_path: "/tmp/eph-fixture/console.log".into(),
-            network: PreparedNetwork { spec: NetworkSpec::None, tap_name: None, macvtap_fd: None, netns: None },
+            network: PreparedNetwork { spec: NetworkSpec::None, tap_name: None, macvtap_fd: None, netns: None, dhcp_leasefile: None },
             guest_cid: None,
             vsock_socket: None,
             disk_format: "qcow2".into(),

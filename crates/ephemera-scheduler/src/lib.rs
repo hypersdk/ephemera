@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use ephemera_core::{
     backend::{LaunchContext, VmBackend},
     config::Config,
-    model::{BackendKind, ClaimOverrides, CloudInitSpec, CreateVmRequest, PoolRecord, PoolSpec, StorageBackend, VmRecord, VmStatus},
+    model::{BackendKind, ClaimOverrides, CloudInitSpec, CreateVmRequest, NetworkSpec, PoolRecord, PoolSpec, StorageBackend, VmRecord, VmStatus},
     process,
 };
 use ephemera_guest_protocol::AgentRequest;
@@ -373,6 +373,8 @@ impl VmManager {
             lvm_lv: None,
             nbd_pid: None,
             virtiofsd_pids: Vec::new(),
+            dhcp_leasefile: None,
+            guest_ip: None,
         };
         // Deciding the CID and reserving it happen as one atomic, locked
         // operation in the store — see ephemera-storage::Store::insert_with_cid
@@ -397,6 +399,7 @@ impl VmManager {
             let network = ephemera_network::prepare(&self.cfg, id, &req.network).await?;
             record.tap_name = network.tap_name.clone();
             record.netns = network.netns.clone();
+            record.dhcp_leasefile = network.dhcp_leasefile.clone();
             record.seed_disk = seed.clone();
 
             // QEMU talks straight to the guest_cid over a real kernel vsock
@@ -446,10 +449,28 @@ impl VmManager {
         Ok(record)
     }
 
-    pub async fn list(&self) -> Vec<VmRecord> { self.store.list().await }
+    pub async fn list(&self) -> Vec<VmRecord> {
+        self.store.list().await.into_iter().map(Self::with_guest_ip).collect()
+    }
 
     pub async fn get(&self, id: Uuid) -> Result<VmRecord> {
-        self.store.get(id).await.context("VM not found")
+        self.store.get(id).await.context("VM not found").map(Self::with_guest_ip)
+    }
+
+    /// Resolves `guest_ip` fresh from the DHCP lease file on every read
+    /// rather than trusting a stored value, since leases renew and this is
+    /// cheap (one small file read, only for netns-networked VMs). Not
+    /// persisted back to the store -- the store keeps `dhcp_leasefile`
+    /// (stable) and leaves `guest_ip` for the caller to fill in, same as
+    /// this method does for every API response.
+    fn with_guest_ip(mut record: VmRecord) -> VmRecord {
+        let mac = match &record.request.network {
+            NetworkSpec::Tap { mac: Some(m), .. } => m.as_str(),
+            _ => return record,
+        };
+        let Some(leasefile) = &record.dhcp_leasefile else { return record };
+        record.guest_ip = ephemera_network::netns::guest_ip_from_lease(leasefile, mac);
+        record
     }
 
     /// Relaunch a `Stopped` VM from its existing disk/seed — unlike
@@ -477,6 +498,7 @@ impl VmManager {
             let network = ephemera_network::prepare(&self.cfg, id, &vm.request.network).await?;
             vm.tap_name = network.tap_name.clone();
             vm.netns = network.netns.clone();
+            vm.dhcp_leasefile = network.dhcp_leasefile.clone();
 
             let vsock_socket = match (vm.guest_cid, vm.backend) {
                 (Some(_), BackendKind::Qemu) => None,

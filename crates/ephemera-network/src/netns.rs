@@ -6,42 +6,72 @@
 //! tap-on-a-shared-bridge mode), built from a veth pair (host <-> namespace)
 //! NATed to the host's own connectivity, plus a small internal bridge
 //! inside the namespace joining the veth's namespace end to the VM's own
-//! tap device.
+//! tap device. A per-namespace `dnsmasq` DHCP server on that bridge hands
+//! the guest a real, usable address -- see `guest_ip_from_lease`.
 //!
 //! Topology (host on the left, the VM's namespace on the right):
 //!
 //! ```text
 //!   host default netns                    │  VM's netns
 //!                                          │
-//!   <vethh> 169.254.X.1/30  <───veth pair───>  <vethn> ── <br> ── <tap> ── VM
-//!        │                                │       169.254.X.2/30 on <br>
-//!   iptables MASQUERADE                   │  default route via 169.254.X.1
-//!   (POSTROUTING -s 169.254.X.0/30)       │
+//!   <vethh> 169.254.X.1/28  <───veth pair───>  <vethn> ── <br> ── <tap> ── VM
+//!        │                                │       169.254.X.2/28 on <br>
+//!   iptables MASQUERADE                   │       dnsmasq DHCP serves
+//!   (POSTROUTING -s 169.254.X.0/28)       │       169.254.X.3-.14 on <br>
+//!                                         │       default route via 169.254.X.1
 //! ```
 //!
-//! The /30 index `X` is derived deterministically from the VM's id (low 6
-//! bits, giving 64 possible subnets in 169.254.0.0/16) rather than tracked
+//! The /28 base `X` is derived deterministically from the VM's id (low 12
+//! bits, giving 4096 possible subnets in 169.254.0.0/16) rather than tracked
 //! in any allocation table — simple, and collision-free for the realistic
 //! number of concurrent namespaced VMs one host would run, at the cost of a
 //! theoretical collision at higher concurrency (documented, not solved,
 //! same tradeoff this project already makes for a few other MVP-scoped
-//! allocators).
+//! allocators). A /28 (16 addresses) rather than the /30 an earlier version
+//! of this module used: a /30 only has room for the two veth endpoints
+//! themselves (.1 host, .2 bridge) with nothing left over for the guest to
+//! actually take an address on the same L2 segment — found live, this
+//! module never actually gave the guest anything to use.
 
 use anyhow::{Context, Result};
 use ephemera_core::process::run_checked;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub struct NetnsHandle {
     pub netns: String,
     pub tap_name: String,
+    pub dhcp_leasefile: PathBuf,
 }
 
 fn short_id(id: Uuid) -> String {
     id.simple().to_string()[..8].to_string()
 }
 
-fn subnet_octet(id: Uuid) -> u8 {
-    (id.as_u128() % 64) as u8 * 4
+/// This VM's /28 block within 169.254.0.0/16, as (third octet, fourth-octet
+/// base). The fourth-octet base is always a multiple of 16 (0, 16, 32, ...,
+/// 240) so `{third}.{base}` through `{third}.{base+15}` is a clean /28 --
+/// 256 third-octet values * 16 blocks each = 4096 possible subnets.
+fn subnet_block(id: Uuid) -> (u8, u8) {
+    let n = (id.as_u128() % 4096) as u16;
+    ((n / 16) as u8, ((n % 16) * 16) as u8)
+}
+
+/// Where this namespace's dnsmasq state (lease file, log, pidfile) lives --
+/// public so callers can derive the lease file path from just a namespace
+/// name (e.g. `VmRecord.netns`) without needing to separately persist it.
+pub fn dhcp_dir(netns: &str) -> PathBuf {
+    // Under /run/ephemera, not a new top-level /run dir: that's the one
+    // path this crate can already write to under ephemera.service's
+    // ProtectSystem=strict + ReadWritePaths hardening (see the service
+    // unit) -- a sibling /run/ephemera-netns-dhcp would need its own
+    // ReadWritePaths entry for no real benefit.
+    PathBuf::from("/run/ephemera/netns-dhcp").join(netns)
+}
+
+/// Path to this namespace's DHCP lease file — see [`guest_ip_from_lease`].
+pub fn leasefile_path(netns: &str) -> PathBuf {
+    dhcp_dir(netns).join("leases")
 }
 
 /// Creates the namespace, veth pair, internal bridge, and tap device
@@ -55,11 +85,15 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
     let veth_ns = format!("vn{short}");
     let bridge = format!("br{short}");
     let tap = format!("tap{short}");
-    let octet = subnet_octet(id);
-    let host_ip = format!("169.254.{octet}.1/30");
-    let ns_ip = format!("169.254.{octet}.2/30");
-    let ns_subnet = format!("169.254.{octet}.0/30");
-    let gateway = format!("169.254.{octet}.1");
+    let (third, base) = subnet_block(id);
+    let host_ip = format!("169.254.{third}.{}/28", base + 1);
+    let ns_ip = format!("169.254.{third}.{}/28", base + 2);
+    let ns_subnet = format!("169.254.{third}.{base}/28");
+    let gateway = format!("169.254.{third}.{}", base + 1);
+    let dhcp_range_start = format!("169.254.{third}.{}", base + 3);
+    let dhcp_range_end = format!("169.254.{third}.{}", base + 14);
+    let dhcp_dir = dhcp_dir(&netns);
+    let dhcp_leasefile = dhcp_dir.join("leases");
 
     let result: Result<()> = async {
         run_checked("ip", &["netns".into(), "add".into(), netns.clone()]).await
@@ -118,11 +152,45 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
             run_checked("iptables", &["-t".into(), "nat".into(), "-A".into(), "POSTROUTING".into(), "-s".into(), ns_subnet, "-j".into(), "MASQUERADE".into()]).await
                 .context("adding NAT rule")?;
         }
+
+        // Give the guest (via tap -> bridge) a real, usable address: a
+        // dnsmasq DHCP server bound only to this namespace's bridge
+        // (--bind-interfaces keeps it off the wildcard :67/:53 sockets, so
+        // it can't collide with any other DHCP/DNS server already running
+        // on the host in the default namespace). --server= pins upstream
+        // DNS explicitly since this namespace has no /etc/resolv.conf of
+        // its own to forward against.
+        std::fs::create_dir_all(&dhcp_dir).context("creating dnsmasq state dir")?;
+        let dnsmasq_log = dhcp_dir.join("dnsmasq.log");
+        let child = ephemera_core::process::spawn_logged(
+            "ip",
+            &[
+                "netns".into(), "exec".into(), netns.clone(), "dnsmasq".into(),
+                "--no-daemon".into(),
+                format!("--interface={bridge}"),
+                "--bind-interfaces".into(),
+                "--except-interface=lo".into(),
+                format!("--dhcp-range={dhcp_range_start},{dhcp_range_end},1h"),
+                format!("--dhcp-leasefile={}", dhcp_leasefile.display()),
+                "--server=1.1.1.1".into(),
+                "--server=8.8.8.8".into(),
+            ],
+            &dnsmasq_log,
+        ).await.context("spawning dnsmasq DHCP server")?;
+        let dnsmasq_pid = child.id().context("dnsmasq exited immediately")?;
+        std::fs::write(dhcp_dir.join("dnsmasq.pid"), dnsmasq_pid.to_string())
+            .context("recording dnsmasq pid")?;
+        // spawn_logged detaches the process into its own process group
+        // (see its doc comment) — it's meant to outlive this call, so drop
+        // the handle without waiting on it, same as every other
+        // long-running process this crate launches this way.
+        drop(child);
+
         Ok(())
     }.await;
 
     match result {
-        Ok(()) => Ok(NetnsHandle { netns, tap_name: tap }),
+        Ok(()) => Ok(NetnsHandle { netns, tap_name: tap, dhcp_leasefile }),
         Err(e) => {
             let _ = cleanup(id, &netns).await;
             Err(e)
@@ -135,10 +203,47 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
 /// veth pair deletes both — the host-side veth end too) and removes the NAT
 /// rule. Best-effort: logs nothing on its own, callers already log/ignore
 /// per the existing `cleanup_tap`/`cleanup_macvtap` convention.
+///
+/// dnsmasq is killed explicitly *before* deleting the namespace: `ip netns
+/// del` only removes the `/var/run/netns/<name>` handle, it doesn't touch
+/// processes that still hold the namespace open (found live -- a namespace
+/// with a still-running dnsmasq inside it survives its own deletion as a
+/// nameless orphan, leaking every interface and the DHCP server along with
+/// it, until that process is killed some other way).
 pub async fn cleanup(id: Uuid, netns: &str) -> Result<()> {
-    let octet = subnet_octet(id);
-    let ns_subnet = format!("169.254.{octet}.0/30");
+    let (third, base) = subnet_block(id);
+    let ns_subnet = format!("169.254.{third}.{base}/28");
+    let dir = dhcp_dir(netns);
+    if let Ok(pid_str) = std::fs::read_to_string(dir.join("dnsmasq.pid")) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            let _ = ephemera_core::process::terminate_pid(pid).await;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
     let _ = run_checked("iptables", &["-t".into(), "nat".into(), "-D".into(), "POSTROUTING".into(), "-s".into(), ns_subnet, "-j".into(), "MASQUERADE".into()]).await;
     let _ = run_checked("ip", &["netns".into(), "del".into(), netns.into()]).await;
     Ok(())
+}
+
+/// Looks up the guest's current DHCP-leased IP by MAC address from a
+/// dnsmasq lease file (`<timestamp> <mac> <ip> <hostname> <client-id>` per
+/// line, one per active lease). Returns `None` if the file doesn't exist
+/// yet (guest hasn't completed a DHCP handshake), the MAC has no current
+/// lease, or the file can't be read -- all treated as "not known yet"
+/// rather than an error, since this is polled repeatedly until the guest
+/// boots far enough to request an address.
+pub fn guest_ip_from_lease(leasefile: &std::path::Path, mac: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(leasefile).ok()?;
+    let mac = mac.to_ascii_lowercase();
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let _timestamp = fields.next()?;
+        let lease_mac = fields.next()?;
+        let ip = fields.next()?;
+        if lease_mac.eq_ignore_ascii_case(&mac) {
+            Some(ip.to_string())
+        } else {
+            None
+        }
+    })
 }

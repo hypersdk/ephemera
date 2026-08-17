@@ -266,6 +266,20 @@ pub struct VmRecord {
     /// on delete/stop by `VmManager` — see `LaunchResult::virtiofsd_pids`.
     #[serde(default)]
     pub virtiofsd_pids: Vec<u32>,
+    /// Path to this VM's per-namespace dnsmasq lease file -- only set for
+    /// `NetworkSpec::Tap { netns: true, .. }` VMs. `VmManager::get`/`list`
+    /// use it to freshly resolve `guest_ip` on every read rather than
+    /// trusting a value that could go stale as leases renew.
+    #[serde(default)]
+    pub dhcp_leasefile: Option<std::path::PathBuf>,
+    /// The guest's IP address on its own private subnet, learned from
+    /// `dhcp_leasefile` by MAC lookup -- only set for `NetworkSpec::Tap {
+    /// netns: true, .. }` VMs (see `ephemera_network::netns`). `None` until
+    /// the guest actually completes a DHCP handshake, and for every other
+    /// networking mode. Recomputed on every read (see `dhcp_leasefile`
+    /// above), not authoritative between reads.
+    #[serde(default)]
+    pub guest_ip: Option<String>,
 }
 
 /// A named template for a warm pool: `size` VMs matching `template` are

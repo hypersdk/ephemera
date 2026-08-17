@@ -318,6 +318,8 @@ mod tests {
             lvm_lv: None,
             nbd_pid: None,
             virtiofsd_pids: vec![],
+            dhcp_leasefile: None,
+            guest_ip: None,
         }
     }
 

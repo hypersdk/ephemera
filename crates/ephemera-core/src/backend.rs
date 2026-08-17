@@ -22,6 +22,11 @@ pub struct PreparedNetwork {
     /// able to open the tap device at all (it lives in a different network
     /// namespace than the VMM process would otherwise be in).
     pub netns: Option<String>,
+    /// Set for `NetworkSpec::Tap { netns: true, .. }`: path to the per-VM
+    /// dnsmasq DHCP server's lease file, so the guest's IP can be looked up
+    /// by MAC once it actually completes a DHCP handshake -- see
+    /// `ephemera_network::netns::guest_ip_from_lease`.
+    pub dhcp_leasefile: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]

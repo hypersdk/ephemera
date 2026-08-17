@@ -14,8 +14,13 @@ RestartSec=2
 # TAP creation needs CAP_NET_ADMIN. KVM needs /dev/kvm access. Disk
 # provisioning (cloud-init/agent injection via guestfs) attaches the image
 # through /dev/nbd*, which needs CAP_SYS_ADMIN for the NBD_SET_SOCK ioctl.
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+# CAP_NET_BIND_SERVICE + CAP_NET_RAW: the per-VM-namespace dnsmasq DHCP
+# server (see ephemera_network::netns) binds UDP/67 (a privileged port) and
+# needs raw sockets for its own DHCP internals -- found live, one at a
+# time: first "Permission denied" binding :67, then (after adding
+# NET_BIND_SERVICE) "process is missing required capability NET_RAW".
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -23,7 +28,10 @@ ProtectHome=true
 # root under /run or /tmp; PrivateTmp gives it an isolated, writable /tmp
 # without opening up the host's shared one.
 PrivateTmp=true
-ReadWritePaths=/var/lib/ephemera /run/ephemera /var/lock
+# /run/netns: per-VM network namespaces (NetworkSpec::Tap { netns: true })
+# persist as bind-mount targets there -- the standard iproute2/kernel
+# location, not something ephemera can relocate.
+ReadWritePaths=/var/lib/ephemera /run/ephemera /var/lock /run/netns
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+#
+# Same shape as ../../config.example.toml, trimmed to what the DaemonSet
+# needs. All paths here must match the hostPath volumes in daemonset.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ephemera-config
+  namespace: ephemera-system
+data:
+  ephemera.toml: |
+    listen = "127.0.0.1:7788"
+    state_dir = "/var/lib/ephemera"
+    run_dir = "/run/ephemera"
+    qemu_binary = "qemu-system-x86_64"
+    qemu_img_binary = "qemu-img"
+    cloud_hypervisor_binary = "cloud-hypervisor"
+    cloud_localds_binary = "cloud-localds"
+    firecracker_binary = "firecracker"
+    default_bridge = "vmbr0"
+    reaper_interval_secs = 5

@@ -1,0 +1,42 @@
+# Copyright 2026 Zyvor
+# SPDX-License-Identifier: Apache-2.0
+#
+# RBAC for the ephemera-kube DaemonSet. Scoped to exactly what
+# crates/ephemera-kube/src/controller.rs does: watch DisposableVm cluster-
+# wide (Api::all), and patch the finalizer (metadata.finalizers, part of the
+# base resource — this CRD does not declare a /finalizers subresource) and
+# status (the /status subresource, since `#[kube(status = "...")]` does
+# declare one). No create/delete on disposablevms: the operator only reacts
+# to CRs created/deleted by whoever owns placement (see ../../README.md's
+# "Kubernetes CRD/operator" section) — it never creates or deletes the CR
+# itself, only the underlying VM.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ephemera-kube
+  namespace: ephemera-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ephemera-kube
+rules:
+  - apiGroups: ["ephemera.zyvor.io"]
+    resources: ["disposablevms"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["ephemera.zyvor.io"]
+    resources: ["disposablevms/status"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ephemera-kube
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ephemera-kube
+subjects:
+  - kind: ServiceAccount
+    name: ephemera-kube
+    namespace: ephemera-system

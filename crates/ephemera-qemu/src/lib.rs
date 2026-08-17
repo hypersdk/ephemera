@@ -75,8 +75,13 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: 
         NetworkSpec::None => {}
         NetworkSpec::User { forwards } => {
             let mut netdev = "user,id=net0".to_string();
+            // Bind to all interfaces, not just loopback: these forwards
+            // exist specifically so a caller outside the host (e.g. SSH
+            // from a laptop) can reach the guest -- 127.0.0.1 would make
+            // every exposed port reachable only from processes already on
+            // the host itself, defeating the feature entirely.
             for f in forwards {
-                netdev.push_str(&format!(",hostfwd={}:127.0.0.1:{}-:{}", f.protocol, f.host_port, f.guest_port));
+                netdev.push_str(&format!(",hostfwd={}:0.0.0.0:{}-:{}", f.protocol, f.host_port, f.guest_port));
             }
             a.extend(["-netdev".into(), netdev, "-device".into(), "virtio-net-pci,netdev=net0".into()]);
         }

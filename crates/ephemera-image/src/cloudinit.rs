@@ -9,7 +9,14 @@ fn yaml_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-pub async fn build_seed(cfg: &Config, dir: &Path, ci: &CloudInitSpec) -> Result<PathBuf> {
+/// `static_net`, when `ci.static_network` is set, is `(guest_cidr, gateway)`
+/// -- e.g. `("169.254.12.35/28", "169.254.12.33")` -- from
+/// `ephemera_network::netns::NetnsHandle`/`PreparedNetwork`. Callers must
+/// run network prep *before* this so that's available; `None` is only
+/// valid when `ci.static_network` is false (checked by the caller, not
+/// re-validated here, since which networking modes have a known address is
+/// this module's caller's concern, not cloud-init seed-building's).
+pub async fn build_seed(cfg: &Config, dir: &Path, ci: &CloudInitSpec, static_net: Option<(&str, &str)>) -> Result<PathBuf> {
     let user_data = dir.join("user-data");
     let meta_data = dir.join("meta-data");
     let seed = dir.join("seed.img");
@@ -39,11 +46,26 @@ pub async fn build_seed(cfg: &Config, dir: &Path, ci: &CloudInitSpec) -> Result<
     fs::write(&user_data, body).context("writing cloud-init user-data")?;
     fs::write(&meta_data, format!("instance-id: {}\nlocal-hostname: {}\n", hostname, hostname))?;
 
-    run_checked(&cfg.cloud_localds_binary, &[
-        "--disk-format".into(), "raw".into(),
-        seed.display().to_string(),
-        user_data.display().to_string(),
-        meta_data.display().to_string(),
-    ]).await?;
+    let mut args = vec!["--disk-format".to_string(), "raw".to_string()];
+    let network_config = dir.join("network-config");
+    if ci.static_network {
+        let (cidr, gateway) = static_net
+            .context("static_network is set but no address was prepared -- network prep must run before build_seed")?;
+        // `match: {name: en*}` rather than a specific interface name: which
+        // predictable name (enp0s1, ens3, eth0, ...) a given kernel/udev
+        // combination assigns isn't known ahead of boot, and this is the
+        // netplan-supported way to say "whichever the single real NIC is".
+        let netcfg = format!(
+            "network:\n  version: 2\n  ethernets:\n    guestnet0:\n      match:\n        name: en*\n      dhcp4: false\n      addresses:\n        - {cidr}\n      routes:\n        - to: default\n          via: {gateway}\n"
+        );
+        fs::write(&network_config, netcfg).context("writing cloud-init network-config")?;
+        args.push("--network-config".into());
+        args.push(network_config.display().to_string());
+    }
+    args.push(seed.display().to_string());
+    args.push(user_data.display().to_string());
+    args.push(meta_data.display().to_string());
+
+    run_checked(&cfg.cloud_localds_binary, &args).await?;
     Ok(seed)
 }

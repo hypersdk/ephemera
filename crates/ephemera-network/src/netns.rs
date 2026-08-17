@@ -42,6 +42,18 @@ pub struct NetnsHandle {
     pub netns: String,
     pub tap_name: String,
     pub dhcp_leasefile: PathBuf,
+    /// The guest's reserved address (bare IP, e.g. "169.254.12.35") --
+    /// always base+3 of the /28, pinned to the guest's MAC via dnsmasq's
+    /// `--dhcp-host`, so it's known and stable from the moment the
+    /// namespace is created rather than only after the guest actually
+    /// completes a DHCP handshake.
+    pub guest_ip: String,
+    /// `guest_ip` with the /28 prefix, e.g. "169.254.12.35/28" -- what a
+    /// static (non-DHCP) guest network-config needs.
+    pub guest_cidr: String,
+    /// The namespace's gateway address (base+1) -- what a static guest
+    /// network-config's route needs.
+    pub gateway: String,
 }
 
 fn short_id(id: Uuid) -> String {
@@ -79,6 +91,10 @@ pub fn leasefile_path(netns: &str) -> PathBuf {
 /// outbound. Best-effort torn down (via `cleanup`) if any step fails partway
 /// through.
 pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
+    // A known MAC is what lets the guest's address be pinned (dnsmasq
+    // --dhcp-host) and therefore known deterministically -- without one
+    // there's nothing to reserve the address against.
+    let mac = mac.context("netns networking requires an explicit MAC address")?;
     let short = short_id(id);
     let netns = format!("eph-{short}");
     let veth_host = format!("vh{short}");
@@ -90,7 +106,9 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
     let ns_ip = format!("169.254.{third}.{}/28", base + 2);
     let ns_subnet = format!("169.254.{third}.{base}/28");
     let gateway = format!("169.254.{third}.{}", base + 1);
-    let dhcp_range_start = format!("169.254.{third}.{}", base + 3);
+    let guest_ip = format!("169.254.{third}.{}", base + 3);
+    let guest_cidr = format!("{guest_ip}/28");
+    let dhcp_range_start = guest_ip.clone();
     let dhcp_range_end = format!("169.254.{third}.{}", base + 14);
     let dhcp_dir = dhcp_dir(&netns);
     let dhcp_leasefile = dhcp_dir.join("leases");
@@ -125,10 +143,8 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
             .context("attaching veth namespace-end to internal bridge")?;
         run_checked("ip", &in_ns(vec!["tuntap".into(), "add".into(), "dev".into(), tap.clone(), "mode".into(), "tap".into()])).await
             .context("creating tap device in namespace")?;
-        if let Some(m) = mac {
-            run_checked("ip", &in_ns(vec!["link".into(), "set".into(), "dev".into(), tap.clone(), "address".into(), m.to_string()])).await
-                .context("setting tap MAC address")?;
-        }
+        run_checked("ip", &in_ns(vec!["link".into(), "set".into(), "dev".into(), tap.clone(), "address".into(), mac.to_string()])).await
+            .context("setting tap MAC address")?;
         run_checked("ip", &in_ns(vec!["link".into(), "set".into(), tap.clone(), "master".into(), bridge.clone()])).await
             .context("attaching tap to internal bridge")?;
         run_checked("ip", &in_ns(vec!["addr".into(), "add".into(), ns_ip, "dev".into(), bridge.clone()])).await
@@ -139,7 +155,7 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
             .context("bringing up tap")?;
         run_checked("ip", &in_ns(vec!["link".into(), "set".into(), bridge.clone(), "up".into()])).await
             .context("bringing up internal bridge")?;
-        run_checked("ip", &in_ns(vec!["route".into(), "add".into(), "default".into(), "via".into(), gateway])).await
+        run_checked("ip", &in_ns(vec!["route".into(), "add".into(), "default".into(), "via".into(), gateway.clone()])).await
             .context("adding default route in namespace")?;
 
         // Host-level: allow the namespace to reach the outside world.
@@ -171,6 +187,12 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
                 "--bind-interfaces".into(),
                 "--except-interface=lo".into(),
                 format!("--dhcp-range={dhcp_range_start},{dhcp_range_end},1h"),
+                // Pins this MAC to guest_ip specifically, rather than
+                // "whichever free address it asks for first" -- makes the
+                // address deterministic and known (see NetnsHandle.guest_ip)
+                // from the moment the namespace exists, not only after the
+                // guest actually completes a DHCP handshake.
+                format!("--dhcp-host={mac},{guest_ip}"),
                 format!("--dhcp-leasefile={}", dhcp_leasefile.display()),
                 "--server=1.1.1.1".into(),
                 "--server=8.8.8.8".into(),
@@ -190,7 +212,7 @@ pub async fn prepare(id: Uuid, mac: Option<&str>) -> Result<NetnsHandle> {
     }.await;
 
     match result {
-        Ok(()) => Ok(NetnsHandle { netns, tap_name: tap, dhcp_leasefile }),
+        Ok(()) => Ok(NetnsHandle { netns, tap_name: tap, dhcp_leasefile, guest_ip, guest_cidr, gateway }),
         Err(e) => {
             let _ = cleanup(id, &netns).await;
             Err(e)

@@ -16,6 +16,9 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
             macvtap_fd: None,
             netns: None,
             dhcp_leasefile: None,
+            guest_ip: None,
+            guest_cidr: None,
+            gateway: None,
         }),
         NetworkSpec::Tap { tap_name, bridge, mac, netns: use_netns } if *use_netns => {
             let handle = netns::prepare(id, mac.as_deref()).await.context("preparing network namespace")?;
@@ -25,6 +28,9 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
                 macvtap_fd: None,
                 netns: Some(handle.netns),
                 dhcp_leasefile: Some(handle.dhcp_leasefile),
+                guest_ip: Some(handle.guest_ip),
+                guest_cidr: Some(handle.guest_cidr),
+                gateway: Some(handle.gateway),
             })
         }
         NetworkSpec::Tap { tap_name, bridge, mac, .. } => {
@@ -46,6 +52,9 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
                 macvtap_fd: None,
                 netns: None,
                 dhcp_leasefile: None,
+                guest_ip: None,
+                guest_cidr: None,
+                gateway: None,
             })
         }
         NetworkSpec::Macvtap { parent, macvtap_mode, mac } => {
@@ -72,6 +81,9 @@ pub async fn prepare(cfg: &Config, id: Uuid, spec: &NetworkSpec) -> Result<Prepa
                     macvtap_fd: Some(fd),
                     netns: None,
                     dhcp_leasefile: None,
+                    guest_ip: None,
+                    guest_cidr: None,
+                    gateway: None,
                 }),
                 Err(e) => {
                     let _ = cleanup_macvtap(&name).await;

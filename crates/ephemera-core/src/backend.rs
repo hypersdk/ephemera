@@ -27,6 +27,18 @@ pub struct PreparedNetwork {
     /// by MAC once it actually completes a DHCP handshake -- see
     /// `ephemera_network::netns::guest_ip_from_lease`.
     pub dhcp_leasefile: Option<std::path::PathBuf>,
+    /// Set for `NetworkSpec::Tap { netns: true, .. }`: the guest's reserved
+    /// address (bare IP, pinned to its MAC via dnsmasq --dhcp-host), known
+    /// deterministically from the moment the namespace is created rather
+    /// than only after a DHCP handshake -- see
+    /// `ephemera_network::netns::NetnsHandle`.
+    pub guest_ip: Option<String>,
+    /// `guest_ip` with the /28 prefix -- what a static (non-DHCP) guest
+    /// network-config's address needs.
+    pub guest_cidr: Option<String>,
+    /// The namespace's gateway address -- what a static guest
+    /// network-config's route needs.
+    pub gateway: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -391,15 +391,23 @@ impl VmManager {
             record.disk = provisioned.disk.clone();
             record.lvm_lv = provisioned.lvm_lv.clone();
             record.nbd_pid = provisioned.nbd_pid;
-            let effective_cloud_init = Self::effective_cloud_init(&req);
-            let seed = match &effective_cloud_init {
-                Some(ci) => Some(ephemera_image::cloudinit::build_seed(&self.cfg, &workspace, ci).await?),
-                None => None,
-            };
+            // Network prep runs before the cloud-init seed: a static
+            // network-config (CloudInitSpec.static_network) needs the
+            // guest's reserved address, which only exists once
+            // ephemera_network::prepare has actually created the namespace
+            // (see ephemera_network::netns::NetnsHandle).
             let network = ephemera_network::prepare(&self.cfg, id, &req.network).await?;
             record.tap_name = network.tap_name.clone();
             record.netns = network.netns.clone();
             record.dhcp_leasefile = network.dhcp_leasefile.clone();
+            record.guest_ip = network.guest_ip.clone();
+
+            let effective_cloud_init = Self::effective_cloud_init(&req);
+            let static_net = network.guest_cidr.as_deref().zip(network.gateway.as_deref());
+            let seed = match &effective_cloud_init {
+                Some(ci) => Some(ephemera_image::cloudinit::build_seed(&self.cfg, &workspace, ci, static_net).await?),
+                None => None,
+            };
             record.seed_disk = seed.clone();
 
             // QEMU talks straight to the guest_cid over a real kernel vsock
@@ -469,7 +477,17 @@ impl VmManager {
             _ => return record,
         };
         let Some(leasefile) = &record.dhcp_leasefile else { return record };
-        record.guest_ip = ephemera_network::netns::guest_ip_from_lease(leasefile, mac);
+        // The address is reserved (dnsmasq --dhcp-host) the moment the
+        // namespace is created -- record.guest_ip is already set to it at
+        // create/start time. A lease-file hit here just confirms the guest
+        // actually completed a DHCP handshake for it; a miss does *not*
+        // mean "not known", it means either the guest hasn't DHCP'd yet or
+        // (CloudInitSpec.static_network) never will, since the address was
+        // configured directly and no DHCP exchange happens at all. Either
+        // way, keep the already-known reservation rather than clearing it.
+        if let Some(ip) = ephemera_network::netns::guest_ip_from_lease(leasefile, mac) {
+            record.guest_ip = Some(ip);
+        }
         record
     }
 
@@ -499,6 +517,7 @@ impl VmManager {
             vm.tap_name = network.tap_name.clone();
             vm.netns = network.netns.clone();
             vm.dhcp_leasefile = network.dhcp_leasefile.clone();
+            vm.guest_ip = network.guest_ip.clone();
 
             let vsock_socket = match (vm.guest_cid, vm.backend) {
                 (Some(_), BackendKind::Qemu) => None,

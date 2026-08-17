@@ -146,6 +146,17 @@ pub struct CloudInitSpec {
     pub packages: Vec<String>,
     #[serde(default)]
     pub runcmd: Vec<String>,
+    /// Configure the guest's network address statically via cloud-init
+    /// (network-config v2) instead of leaving it to the guest's own DHCP
+    /// client. Only meaningful for `NetworkSpec::Tap { netns: true, .. }`
+    /// -- that's the only mode with a known address to inject before boot
+    /// (see `ephemera_network::netns::NetnsHandle`). Ignored (no-op) for
+    /// every other networking mode. The address is the same one DHCP mode
+    /// would hand out anyway (both are pinned to the same reservation) --
+    /// this just skips depending on the guest actually running a working
+    /// DHCP client, which not every image does out of the box.
+    #[serde(default)]
+    pub static_network: bool,
 }
 
 /// A host directory shared into the guest via virtiofs, declared at create

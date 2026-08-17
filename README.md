@@ -933,8 +933,8 @@ its API only accepts a host device name it opens via `/dev/net/tun`, with no fd-
 against a *local* `ephemera serve` instance's REST API — there's no central scheduler placing VMs
 across a fleet (that's the still-deferred "distributed node-agent" item below); each node's operator
 instance only ever acts on `DisposableVm` objects whose `spec.node` matches the node name it was
-started with (`NODE_NAME` env var), same shape as a real daemonset even though this project doesn't
-yet package it as one (no container image build/push in this round — see "Not yet done" below).
+started with (`NODE_NAME` env var), same shape as a real daemonset — see [`deploy/k8s/`](deploy/k8s/)
+for the Dockerfile + CRD/RBAC/DaemonSet manifests that package it as exactly that.
 
 Verified end to end against a real k3s cluster (`scripts/test-kube-operator.sh`, 9/9 passing):
 generate the CRD straight from the Rust type and apply it, create a `DisposableVm`, watch it

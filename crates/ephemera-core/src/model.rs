@@ -157,6 +157,21 @@ pub struct CloudInitSpec {
     /// DHCP client, which not every image does out of the box.
     #[serde(default)]
     pub static_network: bool,
+    /// Files to write into the guest before first boot, via cloud-init's
+    /// own `write_files` module -- e.g. dropping a systemd unit or app
+    /// config without needing a custom image build.
+    #[serde(default)]
+    pub write_files: Vec<CloudInitFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudInitFile {
+    pub path: String,
+    pub content: String,
+    /// Octal file mode, e.g. `"0644"`. Defaults to cloud-init's own default
+    /// (`0644`) when unset.
+    #[serde(default)]
+    pub permissions: Option<String>,
 }
 
 /// A host directory shared into the guest via virtiofs, declared at create

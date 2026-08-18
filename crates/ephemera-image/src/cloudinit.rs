@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ephemera_core::{config::Config, model::CloudInitSpec, process::run_checked};
 use std::{fs, path::{Path, PathBuf}};
 
@@ -41,6 +42,17 @@ pub async fn build_seed(cfg: &Config, dir: &Path, ci: &CloudInitSpec, static_net
     if !ci.runcmd.is_empty() {
         body.push_str("runcmd:\n");
         for cmd in &ci.runcmd { body.push_str(&format!("  - [ bash, -lc, {} ]\n", yaml_quote(cmd))); }
+    }
+    if !ci.write_files.is_empty() {
+        body.push_str("write_files:\n");
+        for f in &ci.write_files {
+            body.push_str(&format!("  - path: {}\n", yaml_quote(&f.path)));
+            if let Some(perms) = &f.permissions {
+                body.push_str(&format!("    permissions: {}\n", yaml_quote(perms)));
+            }
+            body.push_str("    encoding: b64\n");
+            body.push_str(&format!("    content: {}\n", yaml_quote(&B64.encode(f.content.as_bytes()))));
+        }
     }
 
     fs::write(&user_data, body).context("writing cloud-init user-data")?;

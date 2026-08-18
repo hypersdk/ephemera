@@ -11,6 +11,14 @@ Type=simple
 ExecStart=/usr/local/bin/ephemera --config /etc/ephemera.toml serve
 Restart=on-failure
 RestartSec=2
+# Default KillMode (control-group) would SIGTERM every QEMU child process
+# along with ephemera itself on every restart/upgrade, killing every
+# running VM. `reconcile()` (ephemera-scheduler) is explicitly designed to
+# reattach to an already-running VM by checking its stored PID is still
+# alive, not by re-launching it -- so a bare `process` KillMode (only the
+# tracked ExecStart PID, QEMU children left alone) is exactly what lets a
+# binary upgrade/restart happen without disrupting live VMs.
+KillMode=process
 # TAP creation needs CAP_NET_ADMIN. KVM needs /dev/kvm access. Disk
 # provisioning (cloud-init/agent injection via guestfs) attaches the image
 # through /dev/nbd*, which needs CAP_SYS_ADMIN for the NBD_SET_SOCK ioctl.

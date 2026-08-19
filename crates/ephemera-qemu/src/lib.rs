@@ -95,6 +95,14 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: 
             format!("pcie-root-port,id=hotplug-pcie-{i},bus=pcie.0,chassis={},slot={i}", i + 1),
         ]);
     }
+    // A virtio-scsi controller for disk hotplug with bus="scsi" -- unlike
+    // the PCIe root ports above (one device per port), a single
+    // virtio-scsi-pci controller can host many hot-added scsi-hd devices
+    // on its own "scsi0.0" bus, so one is enough. q35 has no built-in
+    // SCSI controller (unlike IDE -- see zyvor-fabricd's hotplug_disk,
+    // which targets the ich9-ahci controller's existing empty ide.0..5
+    // ports directly, no boot-time device needed for that path).
+    a.extend(["-device".into(), "virtio-scsi-pci,id=scsi0,bus=pcie.0".into()]);
 
     if let Some(seed) = &ctx.seed_disk {
         a.extend(["-drive".into(), format!("file={},if=virtio,format=raw,readonly=on", path_arg(seed))]);
@@ -159,6 +167,13 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: 
     let qmp = ctx.workspace.join("qmp.sock");
     a.extend(["-qmp".into(), format!("unix:{},server=on,wait=off", qmp.display())]);
     a.extend(req.extra_args.clone());
+    // Restores CPU/memory/device state from an existing internal snapshot
+    // on this VM's own disk instead of a normal cold boot -- see
+    // CreateVmRequest.loadvm_tag's doc comment for why this is a one-shot
+    // launch override, never persisted onto the stored request.
+    if let Some(tag) = &req.loadvm_tag {
+        a.extend(["-loadvm".into(), tag.clone()]);
+    }
     Ok(a)
 }
 
@@ -289,6 +304,7 @@ mod tests {
             memory_mib,
             max_vcpus: None,
             max_memory_mib: None,
+            loadvm_tag: None,
             disk_size_gib: None,
             kernel: None,
             initrd: None,
@@ -339,6 +355,27 @@ mod tests {
                 "missing hotplug-pcie-{i} root port in {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn adds_a_virtio_scsi_controller_for_scsi_hotplug() {
+        let args = build_args(&req(2048), &ctx(), &[]).unwrap();
+        assert!(args.iter().any(|a| a.starts_with("virtio-scsi-pci,id=scsi0")));
+    }
+
+    #[test]
+    fn no_loadvm_flag_when_tag_unset() {
+        let args = build_args(&req(2048), &ctx(), &[]).unwrap();
+        assert!(!args.iter().any(|a| a == "-loadvm"));
+    }
+
+    #[test]
+    fn appends_loadvm_when_tag_set() {
+        let mut r = req(2048);
+        r.loadvm_tag = Some("hibernate-20260101".into());
+        let args = build_args(&r, &ctx(), &[]).unwrap();
+        let idx = args.iter().position(|a| a == "-loadvm").expect("missing -loadvm flag");
+        assert_eq!(args[idx + 1], "hibernate-20260101");
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub fn router(manager: Arc<VmManager>) -> Router {
         .route("/v1/vms", post(create_vm).get(list_vms))
         .route("/v1/vms/{id}", get(get_vm).delete(delete_vm))
         .route("/v1/vms/{id}/start", post(start_vm))
+        .route("/v1/vms/{id}/start-from-snapshot", post(start_vm_from_snapshot))
         .route("/v1/vms/{id}/stop", post(stop_vm))
         .route("/v1/vms/{id}/pause", post(pause_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
@@ -196,6 +197,19 @@ async fn get_vm(State(m): State<Arc<VmManager>>, Path(id): Path<Uuid>) -> ApiRes
 async fn start_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     require_admin(role)?;
     Ok(Json(json!(m.start(id).await?)))
+}
+#[derive(Debug, serde::Deserialize)]
+struct StartFromSnapshotRequest {
+    tag: String,
+}
+async fn start_vm_from_snapshot(
+    State(m): State<Arc<VmManager>>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<StartFromSnapshotRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(role)?;
+    Ok(Json(json!(m.start_from_snapshot(id, &req.tag).await?)))
 }
 async fn stop_vm(State(m): State<Arc<VmManager>>, Extension(role): Extension<Role>, Path(id): Path<Uuid>) -> ApiResult<Json<serde_json::Value>> {
     require_admin(role)?;
@@ -618,6 +632,7 @@ mod tests {
                 memory_mib: 512,
                 max_vcpus: None,
                 max_memory_mib: None,
+                loadvm_tag: None,
                 disk_size_gib: None,
                 kernel: None,
                 initrd: None,

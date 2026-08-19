@@ -500,6 +500,21 @@ impl VmManager {
     /// (zyvor-fabric's `driver-core::VMDriver::start`) that need to resume a
     /// VM without repeating create-time work.
     pub async fn start(self: &Arc<Self>, id: Uuid) -> Result<VmRecord> {
+        self.start_impl(id, None).await
+    }
+
+    /// Same as [`Self::start`], but relaunches with an existing internal
+    /// (`snapshot-save`) tag on this VM's own disk as a one-shot
+    /// `-loadvm` override -- restores CPU/memory/device state instead of
+    /// an ordinary cold boot. The tag is applied to this single launch
+    /// only, never written into the VM's stored `CreateVmRequest`, so a
+    /// later plain `start` doesn't keep trying to load a now-stale
+    /// snapshot. Added for zyvor-fabric's hibernate/resume feature.
+    pub async fn start_from_snapshot(self: &Arc<Self>, id: Uuid, tag: &str) -> Result<VmRecord> {
+        self.start_impl(id, Some(tag)).await
+    }
+
+    async fn start_impl(self: &Arc<Self>, id: Uuid, loadvm_tag: Option<&str>) -> Result<VmRecord> {
         let mut vm = self.get(id).await?;
         if vm.status == VmStatus::Running {
             return Ok(vm);
@@ -541,7 +556,14 @@ impl VmManager {
                 disk_format: ephemera_image::storage::disk_format(vm.backend, vm.request.storage),
                 nbd_export,
             };
-            let launch = backend(vm.backend)?.launch(&self.cfg, &vm.request, &ctx).await?;
+            // Cloned, not mutated in place: `vm.request` is the VM's
+            // original creation-time request and gets persisted below via
+            // `self.store.update` -- a loadvm_tag baked in there would
+            // stick around and get replayed on every later plain `start`
+            // too, long after the snapshot it names is stale.
+            let mut launch_req = vm.request.clone();
+            launch_req.loadvm_tag = loadvm_tag.map(String::from);
+            let launch = backend(vm.backend)?.launch(&self.cfg, &launch_req, &ctx).await?;
             vm.pid = Some(launch.pid);
             vm.control_socket = launch.control_socket;
             vm.jail_path = launch.jail_path;
@@ -978,6 +1000,7 @@ mod tests {
             memory_mib: 512,
             max_vcpus: None,
             max_memory_mib: None,
+            loadvm_tag: None,
             disk_size_gib: None,
             kernel: kernel.map(Into::into),
             initrd: None,

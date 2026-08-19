@@ -227,6 +227,15 @@ pub struct CreateVmRequest {
     pub cloud_init: Option<CloudInitSpec>,
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// Resume from an existing internal (`snapshot-save`) tag on this VM's
+    /// own disk instead of a normal cold boot -- restores CPU/memory/device
+    /// state via QEMU's `-loadvm`, not just disk content. A one-shot
+    /// override applied to a single `start`/`start_from_snapshot` call
+    /// (see `ephemera_scheduler::VmManager::start_from_snapshot`), never
+    /// persisted onto the VM's own stored `CreateVmRequest` -- a later
+    /// ordinary restart must not keep trying to load a now-stale tag.
+    #[serde(default)]
+    pub loadvm_tag: Option<String>,
     #[serde(default)]
     pub extra_args: Vec<String>,
     #[serde(default)]

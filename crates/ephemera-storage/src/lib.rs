@@ -299,6 +299,7 @@ mod tests {
                 memory_mib: 512,
                 max_vcpus: None,
                 max_memory_mib: None,
+                loadvm_tag: None,
                 disk_size_gib: None,
                 kernel: None,
                 initrd: None,

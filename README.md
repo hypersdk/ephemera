@@ -987,6 +987,39 @@ in-cluster); a `tap`/`macvtap` networking mode in the CRD (needs a device/bridge
 cross-node placement — the "which node should this VM land on" decision is the caller's today, made
 by setting `spec.node` directly, not something this project chooses for you.
 
+## Using Ephemera through Ragnarok
+
+[Ragnarok](../ragnarok) is the primary product consumer of `ephemera-kube` today — it never talks
+to a host's `ephemera serve` REST API directly; it only creates/reads/deletes `DisposableVm` CRs
+and lets the per-node operator (see "Kubernetes CRD/operator" above) do the rest. From Ephemera's
+side, Ragnarok is just another `DisposableVm` client with no special access — the same CRD/RBAC
+setup in `deploy/k8s/` works for it or for `kubectl apply` directly.
+
+**Setup**, from Ephemera's side, is exactly "Deploy order" above — install the CRD/RBAC/DaemonSet,
+label each capable node `ragnarok.io/ephemera-capable=true`, stage images. Ragnarok has no separate
+install step for Ephemera itself; it only detects what's already there (see below).
+
+**What Ragnarok adds on top** (`ragnarok/backend/src/ephemera/`, REST surface in
+`routes/ephemera.rs`, UI in the frontend's `EphemeraHub` page):
+
+- `GET /api/v1/ephemera/capability` — whether the `DisposableVm` CRD is actually registered on the
+  connected cluster (a single `list` call, distinguishing "operator not installed" from "installed,
+  zero VMs" — see `ephemera::workload::disposable_vm_crd_available`'s doc comment for why that's not
+  as simple as checking for an empty list). Ragnarok's Ephemera Hub page shows an "operator not
+  detected" banner instead of a broken-looking empty page when this is false — see the root
+  Ragnarok README's "What works in this beta" table.
+- `GET /api/v1/ephemera/nodes` — nodes labeled `ragnarok.io/ephemera-capable=true`, for a node
+  picker in the UI. Ephemera has no scheduler (see "Kubernetes CRD/operator" above); Ragnarok's
+  create form is the thing choosing `spec.node`, the same way any other caller has to.
+- `GET/POST /api/v1/ephemera/vms`, `GET/DELETE /api/v1/ephemera/vms/{namespace}/{name}` — thin
+  CRUD wrappers around the CR, namespace-scoped to the calling user's RBAC (`enforce_namespace_access`).
+  Ragnarok sets no fields on the CR beyond what a caller could set by hand — no Ragnarok-specific
+  CRD fields or annotations exist today.
+
+**Not done on the Ragnarok side**: `tap`/`macvtap` networking (blocked on the CRD itself not
+supporting it yet — see "Known limitations" in `deploy/k8s/README.md`), and any cross-node
+placement beyond letting the user pick a node from the capable-nodes list.
+
 ## Distributed node-agent
 
 `ephemera-agent` is the non-Kubernetes multi-host story — a caller talks to one central endpoint

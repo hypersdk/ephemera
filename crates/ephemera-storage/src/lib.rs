@@ -297,6 +297,8 @@ mod tests {
                 image: PathBuf::from("/tmp/base.qcow2"),
                 vcpus: 1,
                 memory_mib: 512,
+                max_vcpus: None,
+                max_memory_mib: None,
                 disk_size_gib: None,
                 kernel: None,
                 initrd: None,

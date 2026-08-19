@@ -404,6 +404,50 @@ echo "Installed: $(ephemera --version 2>/dev/null || echo ok)"
 REMOTE
 }
 
+# A freshly installed binary does nothing until the running daemon is
+# restarted onto it -- deploying used to leave the old process running
+# indefinitely (found live: a VM's QEMU command line was still missing a
+# flag added hours after that VM's daemon was last restarted). Safe to do
+# unconditionally on every deploy: the unit's `KillMode=process` (see
+# systemd/ephemera.service) means `restart` only replaces the tracked
+# ephemera PID -- QEMU children are left alone and `reconcile()` reattaches
+# to them by their stored PID on the next `serve` startup, so already
+# -running VMs are not disrupted.
+restart_service() {
+    _ssh bash <<'REMOTE'
+set -e
+SUDO=""
+[ "$(id -u)" -ne 0 ] && SUDO="sudo"
+# qemu-bridge-helper (used for `netdev_add type=bridge` -- NIC hotplug onto
+# an existing bridge) refuses to attach to ANY bridge without an explicit
+# allow-list here, regardless of caller privilege -- found live: hotplug-nic
+# failed with "bridge helper failed" against a real, existing bridge purely
+# because this file didn't exist. `ephemera` already runs as root with
+# CAP_NET_ADMIN (see systemd/ephemera.service), so this check adds no real
+# isolation on top of that -- `allow all` matches the trust boundary that
+# already exists rather than requiring a hand-maintained list that would
+# drift from the bridges zyvor-fabric's networking crate creates dynamically.
+if [ ! -f /etc/qemu/bridge.conf ]; then
+    $SUDO install -d -m755 /etc/qemu
+    printf 'allow all\n' | $SUDO tee /etc/qemu/bridge.conf >/dev/null
+    echo "Created /etc/qemu/bridge.conf (allow all)"
+fi
+$SUDO systemctl enable ephemera 2>/dev/null || true
+$SUDO systemctl restart ephemera
+for i in 1 2 3 4 5; do
+    $SUDO systemctl is-active --quiet ephemera && break
+    sleep 1
+done
+if $SUDO systemctl is-active --quiet ephemera; then
+    echo "ephemera service restarted and active"
+else
+    echo "ERROR: ephemera did not become active after restart" >&2
+    $SUDO systemctl status ephemera --no-pager 2>&1 | tail -20 >&2
+    exit 1
+fi
+REMOTE
+}
+
 verify_remote() {
     info "Running scripts/preflight.sh on ${TARGET_HOST}..."
     if [ "$DRY_RUN" = true ]; then
@@ -438,6 +482,7 @@ deploy_profile_full() {
     run_step "Cloud Hypervisor / Firecracker" install_vmms
     run_step "Rust toolchain" ensure_rust_remote
     run_step "Build and install" build_install_remote
+    run_step "Restart service" restart_service
 }
 
 deploy_profile_quick() {
@@ -449,6 +494,7 @@ deploy_profile_quick() {
         run_step "Sync sources" sync_files
         run_step "Build and install" build_install_remote
     fi
+    run_step "Restart service" restart_service
 }
 
 print_deployment_summary() {
@@ -458,8 +504,8 @@ print_deployment_summary() {
     echo "  remote:  ${REMOTE_DIR}"
     echo ""
     echo "  ssh ${TARGET_USER}@${TARGET_HOST}"
+    echo "  systemctl status ephemera"
     echo "  ephemera --config /etc/ephemera.toml create --spec examples/qemu.json"
-    echo "  ephemera --config /etc/ephemera.toml serve"
     echo "  bash ${REMOTE_DIR}/scripts/preflight.sh"
     echo ""
 }

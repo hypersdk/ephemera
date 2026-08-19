@@ -201,6 +201,16 @@ pub struct CreateVmRequest {
     pub vcpus: u8,
     #[serde(default = "default_memory")]
     pub memory_mib: u64,
+    /// Upper bound for CPU hotplug (`query-hotpluggable-cpus` / `device_add`
+    /// slots) -- must be >= `vcpus`. `None` lets the backend pick a default
+    /// headroom rather than disabling hotplug outright.
+    #[serde(default)]
+    pub max_vcpus: Option<u8>,
+    /// Upper bound for memory hotplug (DIMM `device_add` address space) in
+    /// MiB -- must be >= `memory_mib`. `None` lets the backend pick a
+    /// default headroom rather than disabling hotplug outright.
+    #[serde(default)]
+    pub max_memory_mib: Option<u64>,
     #[serde(default)]
     pub disk_size_gib: Option<u64>,
     #[serde(default)]

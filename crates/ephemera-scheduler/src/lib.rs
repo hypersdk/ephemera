@@ -976,6 +976,8 @@ mod tests {
             image: "/tmp/base.qcow2".into(),
             vcpus: 1,
             memory_mib: 512,
+            max_vcpus: None,
+            max_memory_mib: None,
             disk_size_gib: None,
             kernel: kernel.map(Into::into),
             initrd: None,

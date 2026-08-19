@@ -19,6 +19,17 @@ const QMP_TIMEOUT: Duration = Duration::from_secs(10);
 /// before giving up and launching QEMU anyway (which would then fail to
 /// connect with a clear error, rather than this hanging indefinitely).
 const VIRTIOFSD_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+/// DIMM slots reserved for memory hotplug when `req.max_memory_mib` isn't
+/// set. Each `device_add pc-dimm` (one per hotplug-memory call) consumes
+/// one slot regardless of its size, so this caps hotplug *calls*, not
+/// total addable memory (that's bounded by `maxmem` - `memory_mib`
+/// instead) -- 4 is plenty for the incremental hot-adds this is meant for
+/// without reserving excessive address space for VMs that never use it.
+const DEFAULT_MEMORY_HOTPLUG_SLOTS: u32 = 4;
+/// Upper bound this backend will ever pass to `-smp maxcpus=`. Comfortably
+/// under QEMU's default limit (255 for i440fx/q35 without extra config)
+/// while leaving room for `req.vcpus` itself to approach it.
+const MAX_VCPUS_CEILING: u8 = 254;
 
 pub struct QemuBackend;
 
@@ -37,12 +48,25 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: 
         Some(socket) => format!("file=nbd:unix:{},if=virtio,format=raw", socket.display()),
         None => format!("file={},if=virtio,format={},cache=none,aio=native", path_arg(&ctx.disk), ctx.disk_format),
     };
+    // Reserve hotplug headroom by default so `device_add` (CPU) and
+    // `device_add pc-dimm` (memory) have somewhere to land -- found live:
+    // with a bare `-smp N`/`-m N`, `query-hotpluggable-cpus` reports zero
+    // unrealized slots (hotplug-cpu silently added 0 vCPUs, HTTP 200) and
+    // DIMM hotplug fails outright ("no slots where allocated"). Declaring
+    // extra `maxcpus`/`maxmem` address space here doesn't reserve real
+    // RAM or spin up real vCPU threads up front -- only `req.vcpus` and
+    // `req.memory_mib` are actually allocated at boot -- so this is cheap
+    // even for VMs that never hotplug.
+    let max_vcpus = req.max_vcpus.unwrap_or_else(|| req.vcpus.saturating_mul(2)).max(req.vcpus).min(MAX_VCPUS_CEILING);
+    let max_memory_mib = req
+        .max_memory_mib
+        .unwrap_or_else(|| req.memory_mib.saturating_mul(2).max(req.memory_mib.saturating_add(2048)));
     let mut a = vec![
         "-enable-kvm".into(),
         "-machine".into(), "q35,accel=kvm".into(),
         "-cpu".into(), "host".into(),
-        "-smp".into(), req.vcpus.to_string(),
-        "-m".into(), req.memory_mib.to_string(),
+        "-smp".into(), format!("cpus={},maxcpus={}", req.vcpus, max_vcpus),
+        "-m".into(), format!("{}M,slots={},maxmem={}M", req.memory_mib, DEFAULT_MEMORY_HOTPLUG_SLOTS, max_memory_mib),
         "-nodefaults".into(),
         "-display".into(), "none".into(),
         // Fixed, well-known path within this VM's own workspace — no port
@@ -245,6 +269,8 @@ mod tests {
             image: "/tmp/base.qcow2".into(),
             vcpus: 1,
             memory_mib,
+            max_vcpus: None,
+            max_memory_mib: None,
             disk_size_gib: None,
             kernel: None,
             initrd: None,
@@ -283,7 +309,29 @@ mod tests {
         let args = build_args(&req(2048), &ctx(), &[]).unwrap();
         assert!(!args.iter().any(|a| a.contains("memory-backend-memfd")));
         assert!(!args.iter().any(|a| a.contains("vhost-user-fs-pci")));
-        assert!(args.iter().any(|a| a == "2048"));
+        assert!(args.iter().any(|a| a.starts_with("2048M,slots=")));
+    }
+
+    #[test]
+    fn memory_and_cpu_hotplug_headroom_defaults_when_unset() {
+        let args = build_args(&req(2048), &ctx(), &[]).unwrap();
+        let smp = args.iter().position(|a| a == "-smp").map(|i| &args[i + 1]).unwrap();
+        assert_eq!(smp, "cpus=1,maxcpus=2");
+        let m = args.iter().position(|a| a == "-m").map(|i| &args[i + 1]).unwrap();
+        assert_eq!(m, "2048M,slots=4,maxmem=4096M");
+    }
+
+    #[test]
+    fn memory_and_cpu_hotplug_headroom_respects_explicit_request() {
+        let mut r = req(1024);
+        r.vcpus = 4;
+        r.max_vcpus = Some(8);
+        r.max_memory_mib = Some(4096);
+        let args = build_args(&r, &ctx(), &[]).unwrap();
+        let smp = args.iter().position(|a| a == "-smp").map(|i| &args[i + 1]).unwrap();
+        assert_eq!(smp, "cpus=4,maxcpus=8");
+        let m = args.iter().position(|a| a == "-m").map(|i| &args[i + 1]).unwrap();
+        assert_eq!(m, "1024M,slots=4,maxmem=4096M");
     }
 
     #[test]

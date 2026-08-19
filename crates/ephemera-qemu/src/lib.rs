@@ -30,6 +30,18 @@ const DEFAULT_MEMORY_HOTPLUG_SLOTS: u32 = 4;
 /// under QEMU's default limit (255 for i440fx/q35 without extra config)
 /// while leaving room for `req.vcpus` itself to approach it.
 const MAX_VCPUS_CEILING: u8 = 254;
+/// Empty `pcie-root-port` slots reserved at boot for device hotplug (NIC,
+/// extra disks). q35's root complex (`pcie.0`) itself refuses `device_add`
+/// outright -- found live: "Bus 'pcie.0' does not support hotplugging" --
+/// PCIe hotplug only works on a dedicated root port declared up front.
+/// Each port holds exactly one device, so this also bounds how many
+/// hotplug device_adds a VM can receive before needing a restart. IDs
+/// follow the fixed, predictable `hotplug-pcie-0..N` convention (mirrored
+/// independently in zyvor-fabricd's hotplug handlers, which target one via
+/// `device_add`'s `bus` field, trying each until one's free -- the same
+/// out-of-process REST relationship as the `vnc.sock` path convention
+/// above, not a Rust dependency, so the convention can't be shared as code).
+const HOTPLUG_PCIE_PORTS: u8 = 4;
 
 pub struct QemuBackend;
 
@@ -77,6 +89,12 @@ pub fn build_args(req: &CreateVmRequest, ctx: &LaunchContext, virtiofs_sockets: 
         "-serial".into(), "stdio".into(),
         "-drive".into(), disk_drive,
     ];
+    for i in 0..HOTPLUG_PCIE_PORTS {
+        a.extend([
+            "-device".into(),
+            format!("pcie-root-port,id=hotplug-pcie-{i},bus=pcie.0,chassis={},slot={i}", i + 1),
+        ]);
+    }
 
     if let Some(seed) = &ctx.seed_disk {
         a.extend(["-drive".into(), format!("file={},if=virtio,format=raw,readonly=on", path_arg(seed))]);
@@ -310,6 +328,17 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("memory-backend-memfd")));
         assert!(!args.iter().any(|a| a.contains("vhost-user-fs-pci")));
         assert!(args.iter().any(|a| a.starts_with("2048M,slots=")));
+    }
+
+    #[test]
+    fn reserves_hotpluggable_pcie_root_ports() {
+        let args = build_args(&req(2048), &ctx(), &[]).unwrap();
+        for i in 0..HOTPLUG_PCIE_PORTS {
+            assert!(
+                args.iter().any(|a| a.contains(&format!("pcie-root-port,id=hotplug-pcie-{i},"))),
+                "missing hotplug-pcie-{i} root port in {args:?}"
+            );
+        }
     }
 
     #[test]

@@ -987,6 +987,42 @@ in-cluster); a `tap`/`macvtap` networking mode in the CRD (needs a device/bridge
 cross-node placement — the "which node should this VM land on" decision is the caller's today, made
 by setting `spec.node` directly, not something this project chooses for you.
 
+## Using Ephemera through zyvor-fabric
+
+[zyvor-fabric](../zyvor-fabric) is the other primary consumer of Ephemera, and the older/more
+direct of the two integrations: unlike Ragnarok's Kubernetes CRD approach (see below), zyvor-fabric
+talks straight to a host's `ephemera serve` REST API (`backend/crates/ephemera-driver` +
+`ephemera-client` hand-mirror Ephemera's own DTOs rather than depending on this crate directly —
+see zyvor-fabric's `docs/guides/vm-drivers/ephemera.md`), the same API documented above under "REST
+API". Set `driver = "ephemera"` in zyvor-fabricd's config to opt into it (the default is still
+`machinectl`/systemd-machined — CPU pinning, log streaming, and hotplug require `machinectl` until
+Ephemera gains resource-control and log-streaming endpoints of its own; see the systemd-removal
+migration plan).
+
+**Getting zyvor-fabric**: zyvor-fabric's own repo is private, so its build is published here
+instead, as a self-contained Linux (x86_64) tarball — no cargo/npm required on the target
+machine — attached to this repo's
+[`zyvor-fabric-vX.Y.Z`-tagged releases](https://github.com/hypersdk/ephemera/releases). No
+container image is published; install directly on the host:
+
+```bash
+curl -LO https://github.com/hypersdk/ephemera/releases/download/zyvor-fabric-v0.1.0/zyvor-fabric-0.1.0-linux-x86_64.tar.gz
+tar xzf zyvor-fabric-0.1.0-linux-x86_64.tar.gz
+cd zyvor-fabric-0.1.0-linux-x86_64
+sudo ./install.sh --start
+```
+
+The [release](https://github.com/hypersdk/ephemera/releases/tag/zyvor-fabric-v0.1.0) also carries
+an `INSTALL.md` with a full getting-started tutorial (first login, creating your first VM,
+networking, verifying the install, upgrading). The tarball itself bundles
+`zyvor-fabricd`/`zyvorctl`, a matching Ephemera build, guestkit's vendor agents, the web dashboard,
+systemd units for both `zyvor-fabricd.service` and `ephemera.service`, and default configs --
+`install.sh` wires all of it up (see zyvor-fabric's own `scripts/build-dist.sh` for exactly what
+goes into the package and `scripts/dist-install.sh` for what the installer does). This release
+build carries a 30-day evaluation trial (existing VMs and read access stay available after it
+lapses; new writes need a current trial or license -- check remaining days via `GET /api/license`
+on the running daemon).
+
 ## Using Ephemera through Ragnarok
 
 [Ragnarok](../ragnarok) is the primary product consumer of `ephemera-kube` today — it never talks

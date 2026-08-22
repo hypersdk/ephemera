@@ -1,4 +1,18 @@
+<div align="center">
+
 # Zyvor Ephemera
+
+### Disposable Compute Engine — secure, isolated, short-lived VMs via Firecracker, Cloud Hypervisor, and QEMU/KVM
+
+[![CI](https://github.com/hypersdk/ephemera/actions/workflows/ci.yml/badge.svg)](https://github.com/hypersdk/ephemera/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/github/license/hypersdk/ephemera)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/hypersdk/ephemera?sort=semver)](https://github.com/hypersdk/ephemera/releases)
+
+[Quick start](#build) · [Use cases](docs/use-cases.md) · [zyvor.dev/docs](https://zyvor.dev/docs?utm_source=github&utm_medium=ephemera) · [Blog](https://zyvor.dev/blog?utm_source=github&utm_medium=ephemera)
+
+</div>
+
+---
 
 **Disposable Compute Engine** — create secure, isolated, short-lived virtual machines using
 Firecracker, Cloud Hypervisor, and QEMU/KVM from one Rust-native control plane.
@@ -16,6 +30,40 @@ placement across multiple hosts — see "Kubernetes CRD/operator" and "Distribut
 > This repository is a complete MVP/control-plane skeleton, not a finished multi-tenant security boundary. Authentication/RBAC, the Firecracker jailer (chroot + uid/gid isolation), cgroup v2 resource control, and per-VM network namespaces are already implemented (see "Auth / RBAC", "Firecracker jailer", "Resource control (cgroup v2)", and "Network namespaces" below) — before exposing it to untrusted tenants, still add seccomp/AppArmor/SELinux policy, quotas, audit logging and stronger image provenance.
 
 See [`docs/use-cases.md`](docs/use-cases.md) for concrete use cases — ephemeral CI runners, a golden-image pipeline, Kubernetes-native disposable workloads, multi-host fleets without Kubernetes, and sandboxed code execution — each grounded in what's actually implemented below.
+
+## Table of contents
+
+- [Architecture](#architecture)
+- [Project layout](#project-layout)
+- [What is implemented](#what-is-implemented)
+- [Host requirements](#host-requirements)
+- [Prepare host (one command)](#prepare-host-one-command)
+- [Build](#build)
+- [Deploy to a remote host](#deploy-to-a-remote-host)
+- [Testing networking end-to-end](#testing-networking-end-to-end)
+- [Network namespaces](#network-namespaces-real-per-vm-network-isolation)
+- [Create a QEMU disposable VM](#create-a-qemu-disposable-vm)
+- [Create a Cloud Hypervisor VM](#create-a-cloud-hypervisor-vm)
+- [Create a Firecracker microVM](#create-a-firecracker-microvm)
+- [Firecracker jailer](#firecracker-jailer-chroot-uidgid-isolation-cgroups)
+- [Auto backend selection](#auto-backend-selection)
+- [Policy (admission limits)](#policy-admission-limits)
+- [Pause, resume, and exec](#pause-resume-and-exec)
+- [Resource control (cgroup v2)](#resource-control-cgroup-v2)
+- [Warm VM pools](#warm-vm-pools)
+- [Build an image like a small virt-builder](#build-an-image-like-a-small-virt-builder)
+- [Image catalog & signing](#image-catalog--signing)
+- [Storage backends](#storage-backends)
+- [REST API](#rest-api)
+- [VM JSON contract](#vm-json-contract)
+- [Kubernetes CRD/operator](#kubernetes-crdoperator)
+- [Using Ephemera through zyvor-fabric](#using-ephemera-through-zyvor-fabric)
+- [Using Ephemera through Ragnarok](#using-ephemera-through-ragnarok)
+- [Distributed node-agent](#distributed-node-agent)
+- [State layout](#state-layout)
+- [Production changes I would make next](#production-changes-i-would-make-next)
+- [Important limitations in this MVP](#important-limitations-in-this-mvp)
+- [License](#license)
 
 ## Architecture
 
@@ -1172,3 +1220,5 @@ assigned the same vsock CID.
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 Zyvor.
+
+Part of the Zyvor platform (see [zyvor-fabric](#using-ephemera-through-zyvor-fabric) and [Ragnarok](#using-ephemera-through-ragnarok) above). More at **[zyvor.dev](https://zyvor.dev?utm_source=github&utm_medium=ephemera)**.
